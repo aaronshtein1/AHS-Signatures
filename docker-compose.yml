@@ -1,0 +1,54 @@
+version: '3.8'
+
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    ports:
+      - "3001:3001"
+    environment:
+      - PORT=3001
+      - NODE_ENV=production
+      - DATABASE_URL=file:/app/data/db.sqlite
+      - CORS_ORIGIN=http://localhost:3000
+      - FRONTEND_URL=http://localhost:3000
+      - TOKEN_EXPIRY_HOURS=72
+      - EMAIL_PROVIDER=smtp
+      - SMTP_HOST=mailhog
+      - SMTP_PORT=1025
+      - EMAIL_FROM=signatures@example.com
+      - EMAIL_FROM_NAME=AHS Signatures
+      - ADMIN_EMAIL=admin@example.com
+    volumes:
+      - backend-data:/app/data
+      - backend-uploads:/app/uploads
+      - backend-signed:/app/signed
+    depends_on:
+      - mailhog
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    environment:
+      - NEXT_PUBLIC_API_URL=http://localhost:3001
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+  # Mail catcher for development/testing
+  mailhog:
+    image: mailhog/mailhog:latest
+    ports:
+      - "1025:1025"  # SMTP
+      - "8025:8025"  # Web UI
+    restart: unless-stopped
+
+volumes:
+  backend-data:
+  backend-uploads:
+  backend-signed:

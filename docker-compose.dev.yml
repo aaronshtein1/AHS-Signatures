@@ -1,0 +1,13 @@
+version: '3.8'
+
+services:
+  # Mail catcher for development
+  mailhog:
+    image: mailhog/mailhog:latest
+    ports:
+      - "1025:1025"  # SMTP
+      - "8025:8025"  # Web UI
+
+# Use this for local development:
+# 1. Run: docker-compose -f docker-compose.dev.yml up -d
+# 2. Then run backend and frontend locally with npm run dev
