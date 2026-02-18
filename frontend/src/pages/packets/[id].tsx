@@ -1,11 +1,12 @@
 import { useEffect, useState } from 'react';
 import { useRouter } from 'next/router';
 import Layout from '@/components/Layout';
+import ProtectedRoute from '@/components/ProtectedRoute';
 import StatusBadge from '@/components/StatusBadge';
 import { packets, Packet, AuditLog, admin } from '@/lib/api';
 import { format, formatDistanceToNow } from 'date-fns';
 
-export default function PacketDetailPage() {
+function PacketDetailContent() {
   const router = useRouter();
   const { id } = router.query;
   const [packet, setPacket] = useState<Packet | null>(null);
@@ -99,7 +100,7 @@ export default function PacketDetailPage() {
               <h1 className="text-2xl font-bold text-gray-900">{packet.name}</h1>
               <StatusBadge status={packet.status} />
             </div>
-            <p className="text-gray-600 mt-1">Template: {packet.template.name}</p>
+            <p className="text-gray-600 mt-1">Document: {packet.fileName}</p>
           </div>
           <div className="flex gap-2">
             {packet.status === 'draft' && (
@@ -274,5 +275,13 @@ export default function PacketDetailPage() {
         </div>
       </div>
     </Layout>
+  );
+}
+
+export default function PacketDetailPage() {
+  return (
+    <ProtectedRoute requireAdmin>
+      <PacketDetailContent />
+    </ProtectedRoute>
   );
 }

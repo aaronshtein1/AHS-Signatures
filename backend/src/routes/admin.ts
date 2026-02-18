@@ -1,17 +1,28 @@
 import { FastifyPluginAsync } from 'fastify';
 import { prisma } from '../utils/prisma.js';
+import { requireAdmin } from '../middleware/auth.middleware.js';
 import fs from 'fs/promises';
 import path from 'path';
 
 export const adminRoutes: FastifyPluginAsync = async (fastify) => {
+  // Protect all admin routes
+  fastify.addHook('preHandler', requireAdmin);
+
+  // GET /users - list all users
+  fastify.get('/users', async () => {
+    const users = await prisma.user.findMany({
+      select: { id: true, email: true, name: true, role: true, isActive: true },
+      orderBy: { name: 'asc' },
+    });
+    return users;
+  });
+
   // Dashboard stats
   fastify.get('/stats', async (request, reply) => {
     const [
-      templateCount,
       packetsByStatus,
       recentActivity,
     ] = await Promise.all([
-      prisma.template.count(),
       prisma.signingPacket.groupBy({
         by: ['status'],
         _count: true,
@@ -39,7 +50,6 @@ export const adminRoutes: FastifyPluginAsync = async (fastify) => {
     }
 
     return {
-      templates: templateCount,
       packets: statusCounts,
       totalPackets: Object.values(statusCounts).reduce((a, b) => a + b, 0),
       recentActivity,

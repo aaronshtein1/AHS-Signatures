@@ -2,46 +2,41 @@ import { FastifyPluginAsync } from 'fastify';
 import { prisma } from '../utils/prisma.js';
 import { generateSecureToken, getTokenExpiryDate, generateSigningUrl } from '../utils/token.js';
 import { sendSigningRequest, sendReminderEmail } from '../services/email.service.js';
+import { parseTemplatePlaceholders, getUniqueRoles, Placeholder } from '../services/pdf.service.js';
+import { requireAdmin } from '../middleware/auth.middleware.js';
 import { z } from 'zod';
+import fs from 'fs/promises';
+import path from 'path';
+import { v4 as uuidv4 } from 'uuid';
 
-const createPacketSchema = z.object({
+const recipientSchema = z.object({
+  roleName: z.string().min(1),
   name: z.string().min(1),
-  templateId: z.string().uuid(),
-  recipients: z.array(z.object({
-    roleName: z.string().min(1),
-    name: z.string().min(1),
-    email: z.string().email(),
-    order: z.number().int().min(1),
-  })).min(1),
+  email: z.string().email(),
+  order: z.number().int().min(1),
 });
 
 const updatePacketSchema = z.object({
   name: z.string().min(1).optional(),
-  recipients: z.array(z.object({
-    roleName: z.string().min(1),
-    name: z.string().min(1),
-    email: z.string().email(),
-    order: z.number().int().min(1),
-  })).optional(),
+  recipients: z.array(recipientSchema).optional(),
 });
 
 export const packetRoutes: FastifyPluginAsync = async (fastify) => {
+  // Protect all packet routes - admin only
+  fastify.addHook('preHandler', requireAdmin);
+
   // List all packets
   fastify.get<{
-    Querystring: { status?: string; templateId?: string };
+    Querystring: { status?: string };
   }>('/', async (request, reply) => {
-    const { status, templateId } = request.query;
+    const { status } = request.query;
 
     const packets = await prisma.signingPacket.findMany({
       where: {
         ...(status && { status }),
-        ...(templateId && { templateId }),
       },
       orderBy: { createdAt: 'desc' },
       include: {
-        template: {
-          select: { id: true, name: true },
-        },
         recipients: {
           orderBy: { order: 'asc' },
           select: {
@@ -60,7 +55,10 @@ export const packetRoutes: FastifyPluginAsync = async (fastify) => {
       },
     });
 
-    return packets;
+    return packets.map(p => ({
+      ...p,
+      placeholders: JSON.parse(p.placeholders as string),
+    }));
   });
 
   // Get single packet
@@ -70,7 +68,6 @@ export const packetRoutes: FastifyPluginAsync = async (fastify) => {
     const packet = await prisma.signingPacket.findUnique({
       where: { id },
       include: {
-        template: true,
         recipients: {
           orderBy: { order: 'asc' },
           include: {
@@ -96,37 +93,76 @@ export const packetRoutes: FastifyPluginAsync = async (fastify) => {
 
     return {
       ...packet,
-      template: {
-        ...packet.template,
-        placeholders: JSON.parse(packet.template.placeholders as string),
-      },
+      placeholders: JSON.parse(packet.placeholders as string),
     };
   });
 
-  // Create new packet
-  fastify.post<{ Body: z.infer<typeof createPacketSchema> }>('/', async (request, reply) => {
-    const validation = createPacketSchema.safeParse(request.body);
+  // Create new packet with PDF upload
+  fastify.post('/', async (request, reply) => {
+    // With attachFieldsToBody: true, all fields are in request.body
+    const body = request.body as Record<string, any>;
 
-    if (!validation.success) {
-      return reply.status(400).send({
-        error: 'Validation failed',
-        details: validation.error.errors,
-      });
+    // Get the file field
+    const fileField = body?.file;
+    if (!fileField || !fileField.toBuffer) {
+      return reply.status(400).send({ error: 'No file uploaded' });
     }
 
-    const { name, templateId, recipients } = validation.data;
-
-    // Verify template exists
-    const template = await prisma.template.findUnique({ where: { id: templateId } });
-    if (!template) {
-      return reply.status(404).send({ error: 'Template not found' });
+    if (fileField.mimetype !== 'application/pdf') {
+      return reply.status(400).send({ error: 'Only PDF files are allowed' });
     }
 
-    // Create packet with recipients
+    // Get form fields (they come as { value: string } objects)
+    const name = body?.name?.value || fileField.filename.replace('.pdf', '');
+    const recipientsJson = body?.recipients?.value;
+
+    if (!recipientsJson) {
+      return reply.status(400).send({ error: 'Recipients are required' });
+    }
+
+    // Parse and validate recipients
+    let recipients: z.infer<typeof recipientSchema>[];
+    try {
+      recipients = JSON.parse(recipientsJson);
+      const validation = z.array(recipientSchema).min(1).safeParse(recipients);
+      if (!validation.success) {
+        return reply.status(400).send({
+          error: 'Invalid recipients',
+          details: validation.error.errors,
+        });
+      }
+    } catch (err) {
+      return reply.status(400).send({ error: 'Invalid recipients JSON' });
+    }
+
+    // Generate unique IDs
+    const packetId = uuidv4();
+    const fileId = uuidv4();
+    const fileName = `${fileId}_${fileField.filename}`;
+    const packetDir = path.join(process.cwd(), 'uploads', 'packets', packetId);
+    const filePath = path.join(packetDir, fileName);
+
+    // Ensure directory exists and save file
+    await fs.mkdir(packetDir, { recursive: true });
+    const buffer = await fileField.toBuffer();
+    await fs.writeFile(filePath, buffer);
+
+    // Parse placeholders from PDF
+    let placeholders: Placeholder[] = [];
+    try {
+      placeholders = await parseTemplatePlaceholders(filePath);
+    } catch (err) {
+      console.error('Failed to parse placeholders:', err);
+    }
+
+    // Create packet with embedded PDF info
     const packet = await prisma.signingPacket.create({
       data: {
+        id: packetId,
         name,
-        templateId,
+        fileName: fileField.filename,
+        filePath: `packets/${packetId}/${fileName}`,
+        placeholders: JSON.stringify(placeholders),
         status: 'draft',
         recipients: {
           create: recipients.map(r => ({
@@ -137,9 +173,6 @@ export const packetRoutes: FastifyPluginAsync = async (fastify) => {
         },
       },
       include: {
-        template: {
-          select: { id: true, name: true },
-        },
         recipients: {
           orderBy: { order: 'asc' },
         },
@@ -155,7 +188,13 @@ export const packetRoutes: FastifyPluginAsync = async (fastify) => {
       },
     });
 
-    return packet;
+    const roles = getUniqueRoles(placeholders);
+
+    return {
+      ...packet,
+      placeholders,
+      roles,
+    };
   });
 
   // Update packet (only in draft status)
@@ -209,16 +248,16 @@ export const packetRoutes: FastifyPluginAsync = async (fastify) => {
         }),
       },
       include: {
-        template: {
-          select: { id: true, name: true },
-        },
         recipients: {
           orderBy: { order: 'asc' },
         },
       },
     });
 
-    return updated;
+    return {
+      ...updated,
+      placeholders: JSON.parse(updated.placeholders as string),
+    };
   });
 
   // Send packet (trigger signing workflow)
@@ -405,6 +444,17 @@ export const packetRoutes: FastifyPluginAsync = async (fastify) => {
       return reply.status(400).send({ error: 'Can only delete draft packets' });
     }
 
+    // Delete PDF file
+    try {
+      const fullPath = path.join(process.cwd(), 'uploads', packet.filePath);
+      await fs.unlink(fullPath);
+      // Try to remove the packet directory if empty
+      const packetDir = path.dirname(fullPath);
+      await fs.rmdir(packetDir);
+    } catch (err) {
+      console.error('Failed to delete packet file:', err);
+    }
+
     await prisma.signingPacket.delete({ where: { id } });
 
     return { success: true };
@@ -425,5 +475,21 @@ export const packetRoutes: FastifyPluginAsync = async (fastify) => {
     });
 
     return logs;
+  });
+
+  // Get packet roles (from placeholders)
+  fastify.get<{ Params: { id: string } }>('/:id/roles', async (request, reply) => {
+    const { id } = request.params;
+
+    const packet = await prisma.signingPacket.findUnique({ where: { id } });
+
+    if (!packet) {
+      return reply.status(404).send({ error: 'Packet not found' });
+    }
+
+    const placeholders = JSON.parse(packet.placeholders as string);
+    const roles = getUniqueRoles(placeholders);
+
+    return { roles, placeholders };
   });
 };

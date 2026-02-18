@@ -3,8 +3,12 @@ dotenv.config();
 
 export const config = {
   PORT: parseInt(process.env.PORT || '3001', 10),
-  DATABASE_URL: process.env.DATABASE_URL || 'file:./dev.db',
+  DATABASE_URL: process.env.DATABASE_URL || 'postgresql://postgres:postgres@localhost:5432/ahs_signatures',
   CORS_ORIGIN: process.env.CORS_ORIGIN || 'http://localhost:3000',
+
+  // JWT Authentication
+  JWT_SECRET: process.env.JWT_SECRET || 'change-this-secret-in-production',
+  JWT_EXPIRES_IN: process.env.JWT_EXPIRES_IN || '24h',
 
   // Signing links
   FRONTEND_URL: process.env.FRONTEND_URL || 'http://localhost:3000',

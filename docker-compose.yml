@@ -6,46 +6,41 @@ services:
       context: ./backend
       dockerfile: Dockerfile
     ports:
-      - "3001:3001"
+      - "3041:3001"
     environment:
       - PORT=3001
       - NODE_ENV=production
       - DATABASE_URL=file:/app/data/db.sqlite
-      - CORS_ORIGIN=http://localhost:3000
-      - FRONTEND_URL=http://localhost:3000
+      - CORS_ORIGIN=http://localhost:3040
+      - FRONTEND_URL=http://localhost:3040
       - TOKEN_EXPIRY_HOURS=72
       - EMAIL_PROVIDER=smtp
-      - SMTP_HOST=mailhog
-      - SMTP_PORT=1025
-      - EMAIL_FROM=signatures@example.com
+      - SMTP_HOST=smtp.gmail.com
+      - SMTP_PORT=587
+      - SMTP_USER=aronshteina@gmail.com
+      - SMTP_PASS=oumbdtyajzjolkkq
+      - SMTP_SECURE=false
+      - EMAIL_FROM=aronshteina@gmail.com
       - EMAIL_FROM_NAME=AHS Signatures
-      - ADMIN_EMAIL=admin@example.com
+      - ADMIN_EMAIL=aronshteina@gmail.com
     volumes:
       - backend-data:/app/data
       - backend-uploads:/app/uploads
       - backend-signed:/app/signed
-    depends_on:
-      - mailhog
     restart: unless-stopped
 
   frontend:
     build:
       context: ./frontend
       dockerfile: Dockerfile
+      args:
+        - NEXT_PUBLIC_API_URL=http://localhost:3041
     ports:
-      - "3000:3000"
+      - "3040:3000"
     environment:
-      - NEXT_PUBLIC_API_URL=http://localhost:3001
+      - NEXT_PUBLIC_API_URL=http://localhost:3041
     depends_on:
       - backend
-    restart: unless-stopped
-
-  # Mail catcher for development/testing
-  mailhog:
-    image: mailhog/mailhog:latest
-    ports:
-      - "1025:1025"  # SMTP
-      - "8025:8025"  # Web UI
     restart: unless-stopped
 
 volumes:

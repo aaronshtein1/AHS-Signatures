@@ -1,12 +1,13 @@
 import { useEffect, useState } from 'react';
 import { useRouter } from 'next/router';
 import Layout from '@/components/Layout';
+import ProtectedRoute from '@/components/ProtectedRoute';
 import StatusBadge from '@/components/StatusBadge';
 import { packets, Packet, admin } from '@/lib/api';
 import Link from 'next/link';
 import { formatDistanceToNow } from 'date-fns';
 
-export default function PacketsPage() {
+function PacketsPageContent() {
   const router = useRouter();
   const { status: filterStatus } = router.query;
   const [packetList, setPacketList] = useState<Packet[]>([]);
@@ -124,7 +125,7 @@ export default function PacketsPage() {
           <div className="card p-12 text-center">
             <p className="text-gray-500 mb-4">
               {filterStatus
-                ? `No ${filterStatus.replace('_', ' ')} packets`
+                ? `No ${String(filterStatus).replace('_', ' ')} packets`
                 : 'No packets created yet'}
             </p>
             <Link href="/packets/new" className="btn btn-primary">
@@ -147,7 +148,7 @@ export default function PacketsPage() {
                       <StatusBadge status={packet.status} />
                     </div>
                     <p className="text-sm text-gray-500 mt-1">
-                      Template: {packet.template.name}
+                      Document: {packet.fileName}
                     </p>
 
                     {/* Recipients */}
@@ -240,5 +241,13 @@ export default function PacketsPage() {
         )}
       </div>
     </Layout>
+  );
+}
+
+export default function PacketsPage() {
+  return (
+    <ProtectedRoute requireAdmin>
+      <PacketsPageContent />
+    </ProtectedRoute>
   );
 }

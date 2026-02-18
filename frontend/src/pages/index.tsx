@@ -1,11 +1,12 @@
 import { useEffect, useState } from 'react';
 import Layout from '@/components/Layout';
+import ProtectedRoute from '@/components/ProtectedRoute';
 import StatusBadge from '@/components/StatusBadge';
 import { admin, DashboardStats } from '@/lib/api';
 import Link from 'next/link';
 import { formatDistanceToNow } from 'date-fns';
 
-export default function Dashboard() {
+function DashboardContent() {
   const [stats, setStats] = useState<DashboardStats | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -19,8 +20,14 @@ export default function Dashboard() {
       setLoading(true);
       const data = await admin.stats();
       setStats(data);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to load stats');
+    } catch (err: unknown) {
+      if (err instanceof Error) {
+        setError(err.message);
+      } else if (typeof err === 'string') {
+        setError(err);
+      } else {
+        setError('Failed to connect to server. Is the backend running?');
+      }
     } finally {
       setLoading(false);
     }
@@ -59,15 +66,7 @@ export default function Dashboard() {
         </div>
 
         {/* Stats cards */}
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
-          <div className="card p-6">
-            <p className="text-sm text-gray-500">Templates</p>
-            <p className="text-3xl font-bold text-gray-900">{stats?.templates || 0}</p>
-            <Link href="/templates" className="text-sm text-blue-600 hover:underline">
-              Manage templates →
-            </Link>
-          </div>
-
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
           <div className="card p-6">
             <p className="text-sm text-gray-500">Total Packets</p>
             <p className="text-3xl font-bold text-gray-900">{stats?.totalPackets || 0}</p>
@@ -149,14 +148,19 @@ export default function Dashboard() {
 
         {/* Quick actions */}
         <div className="flex flex-wrap gap-4">
-          <Link href="/templates/upload" className="btn btn-primary">
-            Upload Template
-          </Link>
-          <Link href="/packets/new" className="btn btn-secondary">
+          <Link href="/packets/new" className="btn btn-primary">
             Create Packet
           </Link>
         </div>
       </div>
     </Layout>
+  );
+}
+
+export default function Dashboard() {
+  return (
+    <ProtectedRoute requireAdmin>
+      <DashboardContent />
+    </ProtectedRoute>
   );
 }

@@ -1,132 +1,61 @@
 import { PrismaClient } from '@prisma/client';
-import { createSampleTemplate } from '../src/services/pdf.service.js';
-import { generateSecureToken, getTokenExpiryDate } from '../src/utils/token.js';
+import bcrypt from 'bcrypt';
 import fs from 'fs/promises';
 import path from 'path';
 
 const prisma = new PrismaClient();
 
+const SALT_ROUNDS = 10;
+
+async function hashPassword(password: string): Promise<string> {
+  return bcrypt.hash(password, SALT_ROUNDS);
+}
+
 async function main() {
-  console.log('🌱 Seeding database...');
+  console.log('Seeding database...');
 
   // Create upload directories
-  const dirs = ['uploads/templates', 'uploads/signatures', 'signed'];
+  const dirs = ['uploads/packets', 'signed'];
   for (const dir of dirs) {
     const fullPath = path.join(process.cwd(), dir);
     await fs.mkdir(fullPath, { recursive: true });
   }
+  console.log('Created upload directories');
 
-  // Create sample templates
-  const templates = [
-    {
-      name: 'Employee Acknowledgment Form',
-      description: 'Standard employee acknowledgment for policy updates',
-      roles: ['employee', 'manager'],
+  // Create demo admin user
+  const adminPassword = await hashPassword('admin123');
+  const admin = await prisma.user.upsert({
+    where: { email: 'admin@example.com' },
+    update: {},
+    create: {
+      email: 'admin@example.com',
+      passwordHash: adminPassword,
+      name: 'Admin User',
+      role: 'admin',
+      isActive: true,
     },
-    {
-      name: 'NDA Agreement',
-      description: 'Non-disclosure agreement for contractors',
-      roles: ['contractor', 'company'],
-    },
-    {
-      name: 'Equipment Receipt',
-      description: 'Acknowledgment of equipment received',
-      roles: ['recipient'],
-    },
-  ];
-
-  for (const t of templates) {
-    // Generate PDF with placeholders
-    const pdfBytes = await createSampleTemplate(t.name, t.roles);
-    const fileName = `demo_${t.name.toLowerCase().replace(/\s+/g, '_')}.pdf`;
-    const filePath = path.join(process.cwd(), 'uploads', 'templates', fileName);
-    await fs.writeFile(filePath, pdfBytes);
-
-    // Build placeholder data
-    const placeholders = [];
-    let yPos = 595;
-
-    for (const role of t.roles) {
-      placeholders.push({
-        type: 'SIGNATURE',
-        role,
-        pageNumber: 1,
-        x: 50,
-        y: yPos,
-        width: 200,
-        height: 50,
-      });
-      placeholders.push({
-        type: 'DATE',
-        role,
-        pageNumber: 1,
-        x: 340,
-        y: yPos + 25,
-        width: 100,
-        height: 25,
-      });
-      yPos -= 100;
-    }
-
-    await prisma.template.create({
-      data: {
-        name: t.name,
-        description: t.description,
-        fileName,
-        filePath: `templates/${fileName}`,
-        placeholders: JSON.stringify(placeholders),
-      },
-    });
-
-    console.log(`✅ Created template: ${t.name}`);
-  }
-
-  // Create a sample signing packet
-  const employeeTemplate = await prisma.template.findFirst({
-    where: { name: 'Employee Acknowledgment Form' },
   });
+  console.log(`Created admin user: ${admin.email}`);
 
-  if (employeeTemplate) {
-    const packet = await prisma.signingPacket.create({
-      data: {
-        name: 'Q1 Policy Update Acknowledgment - John Doe',
-        templateId: employeeTemplate.id,
-        status: 'draft',
-        recipients: {
-          create: [
-            {
-              roleName: 'employee',
-              name: 'John Doe',
-              email: 'john.doe@example.com',
-              order: 1,
-              token: generateSecureToken(),
-              tokenExpiresAt: getTokenExpiryDate(),
-            },
-            {
-              roleName: 'manager',
-              name: 'Jane Smith',
-              email: 'jane.smith@example.com',
-              order: 2,
-              token: generateSecureToken(),
-              tokenExpiresAt: getTokenExpiryDate(),
-            },
-          ],
-        },
-      },
-    });
+  // Create demo regular user
+  const userPassword = await hashPassword('user123');
+  const user = await prisma.user.upsert({
+    where: { email: 'user@example.com' },
+    update: {},
+    create: {
+      email: 'user@example.com',
+      passwordHash: userPassword,
+      name: 'Demo User',
+      role: 'user',
+      isActive: true,
+    },
+  });
+  console.log(`Created regular user: ${user.email}`);
 
-    await prisma.auditLog.create({
-      data: {
-        packetId: packet.id,
-        action: 'created',
-        details: 'Demo packet created via seed',
-      },
-    });
-
-    console.log(`✅ Created sample packet: ${packet.name}`);
-  }
-
-  console.log('🌱 Seeding complete!');
+  console.log('\nDemo credentials:');
+  console.log('  Admin: admin@example.com / admin123');
+  console.log('  User:  user@example.com / user123');
+  console.log('\nSeeding complete!');
 }
 
 main()

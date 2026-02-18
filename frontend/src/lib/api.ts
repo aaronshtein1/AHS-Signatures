@@ -1,25 +1,14 @@
-const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001';
+// API client with authentication support
+const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001';
 
-interface FetchOptions extends RequestInit {
-  data?: unknown;
-}
+// Simple fetch wrapper for JSON APIs with credentials
+async function api<T>(endpoint: string, options: RequestInit = {}): Promise<T> {
+  const url = `${API_URL}${endpoint}`;
 
-async function fetchApi<T>(endpoint: string, options: FetchOptions = {}): Promise<T> {
-  const { data, ...fetchOptions } = options;
-
-  const config: RequestInit = {
-    ...fetchOptions,
-    headers: {
-      'Content-Type': 'application/json',
-      ...fetchOptions.headers,
-    },
-  };
-
-  if (data) {
-    config.body = JSON.stringify(data);
-  }
-
-  const response = await fetch(`${API_BASE}${endpoint}`, config);
+  const response = await fetch(url, {
+    ...options,
+    credentials: 'include', // Include cookies for auth
+  });
 
   if (!response.ok) {
     const error = await response.json().catch(() => ({ error: 'Request failed' }));
@@ -29,80 +18,127 @@ async function fetchApi<T>(endpoint: string, options: FetchOptions = {}): Promis
   return response.json();
 }
 
-// Templates
-export const templates = {
-  list: () => fetchApi<Template[]>('/api/templates'),
-  get: (id: string) => fetchApi<Template>(`/api/templates/${id}`),
-  upload: async (formData: FormData) => {
-    const response = await fetch(`${API_BASE}/api/templates`, {
+// Auth API
+export const auth = {
+  login: (email: string, password: string) =>
+    api<{ user: User }>('/api/auth/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email, password }),
+    }),
+
+  logout: () => api<{ success: boolean }>('/api/auth/logout', { method: 'POST' }),
+
+  me: () => api<User>('/api/auth/me'),
+};
+
+// Packets API
+export const packets = {
+  list: (params?: { status?: string }) => {
+    const query = params ? `?${new URLSearchParams(params as Record<string, string>)}` : '';
+    return api<Packet[]>(`/api/packets${query}`);
+  },
+
+  get: (id: string) => api<Packet>(`/api/packets/${id}`),
+
+  create: async (formData: FormData): Promise<Packet> => {
+    const response = await fetch(`${API_URL}/api/packets`, {
       method: 'POST',
       body: formData,
+      credentials: 'include',
     });
+
     if (!response.ok) {
       const error = await response.json().catch(() => ({ error: 'Upload failed' }));
       throw new Error(error.error || 'Upload failed');
     }
+
     return response.json();
   },
-  delete: (id: string) => fetchApi(`/api/templates/${id}`, { method: 'DELETE' }),
-  getRoles: (id: string) => fetchApi<{ roles: string[]; placeholders: Placeholder[] }>(`/api/templates/${id}/roles`),
+
+  update: (id: string, data: UpdatePacketData) =>
+    api<Packet>(`/api/packets/${id}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data),
+    }),
+
+  delete: (id: string) => api<void>(`/api/packets/${id}`, { method: 'DELETE' }),
+
+  send: (id: string) => api<{ success: boolean }>(`/api/packets/${id}/send`, { method: 'POST' }),
+
+  resend: (id: string) => api<{ success: boolean }>(`/api/packets/${id}/resend`, { method: 'POST' }),
+
+  cancel: (id: string) => api<void>(`/api/packets/${id}/cancel`, { method: 'POST' }),
+
+  timeline: (id: string) => api<AuditLog[]>(`/api/packets/${id}/timeline`),
+
+  getRoles: (id: string) => api<{ roles: string[]; placeholders: Placeholder[] }>(`/api/packets/${id}/roles`),
 };
 
-// Packets
-export const packets = {
-  list: (params?: { status?: string; templateId?: string }) => {
-    const query = params ? `?${new URLSearchParams(params as Record<string, string>)}` : '';
-    return fetchApi<Packet[]>(`/api/packets${query}`);
-  },
-  get: (id: string) => fetchApi<Packet>(`/api/packets/${id}`),
-  create: (data: CreatePacketData) => fetchApi<Packet>('/api/packets', { method: 'POST', data }),
-  update: (id: string, data: Partial<CreatePacketData>) =>
-    fetchApi<Packet>(`/api/packets/${id}`, { method: 'PATCH', data }),
-  delete: (id: string) => fetchApi(`/api/packets/${id}`, { method: 'DELETE' }),
-  send: (id: string) => fetchApi(`/api/packets/${id}/send`, { method: 'POST' }),
-  resend: (id: string) => fetchApi(`/api/packets/${id}/resend`, { method: 'POST' }),
-  cancel: (id: string) => fetchApi(`/api/packets/${id}/cancel`, { method: 'POST' }),
-  timeline: (id: string) => fetchApi<AuditLog[]>(`/api/packets/${id}/timeline`),
-};
-
-// Signing
+// Signing API (public - uses token auth)
 export const signing = {
-  getSession: (token: string) => fetchApi<SigningSession>(`/api/signing/${token}`),
+  getSession: (token: string) => api<SigningSession>(`/api/signing/${token}`),
+
   submit: (token: string, data: SignatureSubmission) =>
-    fetchApi<{ success: boolean; completed: boolean; message: string }>(
-      `/api/signing/${token}/sign`,
-      { method: 'POST', data }
-    ),
-  getPdfUrl: (token: string) => `${API_BASE}/api/signing/${token}/pdf`,
+    api<{ success: boolean; completed: boolean; message: string }>(`/api/signing/${token}/sign`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data),
+    }),
+
+  getPdfUrl: (token: string) => `${API_URL}/api/signing/${token}/pdf`,
 };
 
-// Admin
+// Admin API
 export const admin = {
-  stats: () => fetchApi<DashboardStats>('/api/admin/stats'),
-  downloadUrl: (packetId: string) => `${API_BASE}/api/admin/packets/${packetId}/download`,
+  stats: () => api<DashboardStats>('/api/admin/stats'),
+
+  downloadUrl: (packetId: string) => `${API_URL}/api/admin/packets/${packetId}/download`,
+
   auditLogs: (params?: Record<string, string>) => {
     const query = params ? `?${new URLSearchParams(params)}` : '';
-    return fetchApi<AuditLog[]>(`/api/admin/audit-logs${query}`);
+    return api<AuditLog[]>(`/api/admin/audit-logs${query}`);
   },
+
+  users: () => api<User[]>('/api/admin/users'),
+};
+
+// User Documents API (for regular users)
+export const userDocs = {
+  list: () => api<UserDocument[]>('/api/user/documents'),
+
+  getSignUrl: (id: string) => api<{ signUrl: string }>(`/api/user/documents/${id}/sign-url`),
 };
 
 // Types
-export interface Template {
+export interface User {
   id: string;
+  email: string;
   name: string;
-  description: string | null;
-  fileName: string;
-  filePath: string;
-  placeholders: Placeholder[];
-  createdAt: string;
-  updatedAt: string;
-  packetCount?: number;
+  role: 'admin' | 'user';
+}
+
+export interface UserDocument {
+  id: string;
+  roleName: string;
+  status: string;
+  signedAt: string | null;
+  packet: {
+    id: string;
+    name: string;
+    fileName: string;
+    status: string;
+    createdAt: string;
+  };
+  canSign: boolean;
 }
 
 export interface Placeholder {
   type: 'SIGNATURE' | 'DATE' | 'TEXT';
   role: string;
   fieldName?: string;
+  originalTag?: string;
   pageNumber: number;
   x: number;
   y: number;
@@ -118,6 +154,7 @@ export interface Recipient {
   order: number;
   status: 'pending' | 'notified' | 'signed' | 'skipped';
   signedAt: string | null;
+  userId?: string;
   signature?: {
     id: string;
     signatureType: string;
@@ -129,29 +166,27 @@ export interface Recipient {
 export interface Packet {
   id: string;
   name: string;
-  templateId: string;
-  template: {
-    id: string;
-    name: string;
-    placeholders?: Placeholder[];
-  };
+  fileName: string;
+  filePath: string;
+  placeholders: Placeholder[];
   status: 'draft' | 'sent' | 'in_progress' | 'completed' | 'cancelled';
   signedPdfPath: string | null;
   createdAt: string;
   updatedAt: string;
   completedAt: string | null;
   recipients: Recipient[];
+  roles?: string[];
   auditLogs?: AuditLog[];
 }
 
-export interface CreatePacketData {
-  name: string;
-  templateId: string;
-  recipients: {
+export interface UpdatePacketData {
+  name?: string;
+  recipients?: {
     roleName: string;
     name: string;
     email: string;
     order: number;
+    userId?: string;
   }[];
 }
 
@@ -169,7 +204,6 @@ export interface AuditLog {
 }
 
 export interface DashboardStats {
-  templates: number;
   packets: {
     draft: number;
     sent: number;
@@ -193,9 +227,8 @@ export interface SigningSession {
     name: string;
     status: string;
   };
-  template: {
-    id: string;
-    name: string;
+  document: {
+    fileName: string;
     filePath: string;
   };
   placeholders: Placeholder[];

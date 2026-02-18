@@ -1,6 +1,7 @@
 import Link from 'next/link';
 import { useRouter } from 'next/router';
 import { ReactNode } from 'react';
+import { useAuth } from '@/contexts/AuthContext';
 
 interface LayoutProps {
   children: ReactNode;
@@ -8,12 +9,25 @@ interface LayoutProps {
 
 export default function Layout({ children }: LayoutProps) {
   const router = useRouter();
+  const { user, logout, isAdmin } = useAuth();
 
-  const navItems = [
+  const handleLogout = async () => {
+    await logout();
+    router.push('/login');
+  };
+
+  // Admin navigation items
+  const adminNavItems = [
     { href: '/', label: 'Dashboard' },
-    { href: '/templates', label: 'Templates' },
     { href: '/packets', label: 'Packets' },
   ];
+
+  // User navigation items
+  const userNavItems = [
+    { href: '/my-documents', label: 'My Documents' },
+  ];
+
+  const navItems = isAdmin ? adminNavItems : userNavItems;
 
   return (
     <div className="min-h-screen bg-gray-50">
@@ -22,7 +36,7 @@ export default function Layout({ children }: LayoutProps) {
           <div className="flex justify-between h-16">
             <div className="flex">
               <div className="flex-shrink-0 flex items-center">
-                <Link href="/" className="text-xl font-bold text-blue-600">
+                <Link href={isAdmin ? '/' : '/my-documents'} className="text-xl font-bold text-blue-600">
                   AHS Signatures
                 </Link>
               </div>
@@ -46,8 +60,25 @@ export default function Layout({ children }: LayoutProps) {
                 })}
               </div>
             </div>
-            <div className="flex items-center">
-              <span className="text-sm text-gray-500">Admin Panel</span>
+            <div className="flex items-center space-x-4">
+              {user && (
+                <>
+                  <div className="text-sm">
+                    <span className="text-gray-700">{user.name}</span>
+                    <span className={`ml-2 px-2 py-0.5 text-xs font-medium rounded-full ${
+                      isAdmin ? 'bg-purple-100 text-purple-700' : 'bg-gray-100 text-gray-600'
+                    }`}>
+                      {isAdmin ? 'Admin' : 'User'}
+                    </span>
+                  </div>
+                  <button
+                    onClick={handleLogout}
+                    className="text-sm text-gray-500 hover:text-gray-700"
+                  >
+                    Logout
+                  </button>
+                </>
+              )}
             </div>
           </div>
         </div>
@@ -83,7 +114,7 @@ export default function Layout({ children }: LayoutProps) {
       <footer className="border-t border-gray-200 py-4">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
           <p className="text-center text-sm text-gray-500">
-            Lightweight PDF Signing System • For internal acknowledgements only
+            Lightweight PDF Signing System
           </p>
         </div>
       </footer>

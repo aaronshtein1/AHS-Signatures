@@ -3,29 +3,32 @@ generator client {
 }
 
 datasource db {
-  provider = "sqlite"
+  provider = "postgresql"
   url      = env("DATABASE_URL")
 }
 
-// PDF Template uploaded by admin
-model Template {
+// Admin/staff users who can create and manage signing packets
+model User {
   id           String   @id @default(uuid())
+  email        String   @unique
+  passwordHash String
   name         String
-  description  String?
-  fileName     String
-  filePath     String
-  placeholders Json     // Array of detected placeholders
+  role         String   @default("user") // "admin" or "user"
+  isActive     Boolean  @default(true)
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
-  packets      SigningPacket[]
+  lastLoginAt  DateTime?
+
+  @@index([email])
 }
 
-// A signing packet created from a template
+// A signing packet with its own uploaded PDF document
 model SigningPacket {
   id              String   @id @default(uuid())
   name            String
-  templateId      String
-  template        Template @relation(fields: [templateId], references: [id])
+  fileName        String   // Original uploaded file name
+  filePath        String   // Storage path: packets/{id}/{filename}
+  placeholders    String   // JSON string of detected placeholders
   status          String   @default("draft") // draft, sent, in_progress, completed, cancelled
   signedPdfPath   String?  // Path to final signed PDF
   createdAt       DateTime @default(now())
@@ -62,7 +65,7 @@ model Signature {
   signatureData String   // Base64 image data or typed text
   signatureType String   // "drawn" or "typed"
   typedName     String?  // Name typed by signer
-  textFields    Json?    // Any additional text field values
+  textFields    String?  // JSON string of additional text field values
   ipAddress     String?
   userAgent     String?
   createdAt     DateTime @default(now())

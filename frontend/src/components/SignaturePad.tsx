@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, useCallback } from 'react';
 import SignaturePadLib from 'signature_pad';
 
 interface SignaturePadProps {
@@ -14,34 +14,86 @@ export default function SignaturePad({
 }: SignaturePadProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const signaturePadRef = useRef<SignaturePadLib | null>(null);
+  const onSignatureChangeRef = useRef(onSignatureChange);
   const [mode, setMode] = useState<'draw' | 'type'>('draw');
+  const [isInitialized, setIsInitialized] = useState(false);
 
+  // Keep callback ref updated
   useEffect(() => {
-    if (canvasRef.current && mode === 'draw') {
+    onSignatureChangeRef.current = onSignatureChange;
+  }, [onSignatureChange]);
+
+  // Initialize signature pad only once when in draw mode
+  useEffect(() => {
+    if (canvasRef.current && mode === 'draw' && !isInitialized) {
       const canvas = canvasRef.current;
+
+      // Set canvas size based on its CSS dimensions
+      const rect = canvas.getBoundingClientRect();
       const ratio = Math.max(window.devicePixelRatio || 1, 1);
 
-      canvas.width = canvas.offsetWidth * ratio;
-      canvas.height = canvas.offsetHeight * ratio;
-      canvas.getContext('2d')?.scale(ratio, ratio);
+      canvas.width = rect.width * ratio;
+      canvas.height = rect.height * ratio;
 
+      const ctx = canvas.getContext('2d');
+      if (ctx) {
+        ctx.scale(ratio, ratio);
+      }
+
+      // Create signature pad instance
       signaturePadRef.current = new SignaturePadLib(canvas, {
         backgroundColor: 'rgb(255, 255, 255)',
         penColor: 'rgb(0, 0, 100)',
+        minWidth: 1,
+        maxWidth: 3,
       });
 
+      // Handle stroke end
       signaturePadRef.current.addEventListener('endStroke', () => {
         if (signaturePadRef.current && !signaturePadRef.current.isEmpty()) {
           const dataUrl = signaturePadRef.current.toDataURL('image/png');
-          onSignatureChange(dataUrl, 'drawn');
+          onSignatureChangeRef.current(dataUrl, 'drawn');
         }
       });
 
+      setIsInitialized(true);
+
       return () => {
-        signaturePadRef.current?.off();
+        if (signaturePadRef.current) {
+          signaturePadRef.current.off();
+          signaturePadRef.current = null;
+        }
+        setIsInitialized(false);
       };
     }
-  }, [mode, onSignatureChange]);
+  }, [mode, isInitialized]);
+
+  // Handle window resize
+  useEffect(() => {
+    const handleResize = () => {
+      if (canvasRef.current && signaturePadRef.current && mode === 'draw') {
+        const canvas = canvasRef.current;
+        const data = signaturePadRef.current.toData();
+
+        const rect = canvas.getBoundingClientRect();
+        const ratio = Math.max(window.devicePixelRatio || 1, 1);
+
+        canvas.width = rect.width * ratio;
+        canvas.height = rect.height * ratio;
+
+        const ctx = canvas.getContext('2d');
+        if (ctx) {
+          ctx.scale(ratio, ratio);
+        }
+
+        // Restore the signature data
+        signaturePadRef.current.fromData(data);
+      }
+    };
+
+    window.addEventListener('resize', handleResize);
+    return () => window.removeEventListener('resize', handleResize);
+  }, [mode]);
 
   const clearSignature = () => {
     if (signaturePadRef.current) {
@@ -60,6 +112,10 @@ export default function SignaturePad({
   };
 
   const switchMode = (newMode: 'draw' | 'type') => {
+    if (newMode === 'draw' && mode !== 'draw') {
+      // Reset initialization flag so pad will be recreated
+      setIsInitialized(false);
+    }
     setMode(newMode);
     onSignatureChange(null, newMode === 'draw' ? 'drawn' : 'typed');
     if (newMode === 'type' && typedName.trim()) {
@@ -98,16 +154,22 @@ export default function SignaturePad({
       {/* Signature input */}
       {mode === 'draw' ? (
         <div className="space-y-2">
-          <canvas
-            ref={canvasRef}
-            className="signature-canvas w-full h-40"
-          />
+          <div className="border-2 border-gray-300 rounded-lg bg-white">
+            <canvas
+              ref={canvasRef}
+              className="w-full h-40 rounded-lg cursor-crosshair"
+              style={{ touchAction: 'none' }}
+            />
+          </div>
+          <p className="text-xs text-gray-500 text-center">
+            Sign above using your mouse or finger
+          </p>
           <button
             type="button"
             onClick={clearSignature}
-            className="text-sm text-gray-500 hover:text-gray-700"
+            className="text-sm text-blue-500 hover:text-blue-700 font-medium"
           >
-            Clear signature
+            Clear and start over
           </button>
         </div>
       ) : (

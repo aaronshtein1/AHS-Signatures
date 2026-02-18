@@ -26,7 +26,6 @@ export const signingRoutes: FastifyPluginAsync = async (fastify) => {
       include: {
         packet: {
           include: {
-            template: true,
             recipients: {
               orderBy: { order: 'asc' },
               select: {
@@ -86,11 +85,20 @@ export const signingRoutes: FastifyPluginAsync = async (fastify) => {
       },
     });
 
-    const placeholders = JSON.parse(recipient.packet.template.placeholders as string);
+    const placeholders = JSON.parse(recipient.packet.placeholders as string);
 
     // Filter placeholders for this recipient's role
+    // Include: SIGNATURE for this role, DATE (always shown), TEXT (always shown)
     const recipientPlaceholders = placeholders.filter(
-      (p: Placeholder) => p.role === recipient.roleName || p.type === 'TEXT'
+      (p: Placeholder) => {
+        // TEXT and DATE fields are shown for all signers
+        if (p.type === 'TEXT' || p.type === 'DATE') return true;
+        // SIGNATURE fields are matched by role (signer, signer1, etc.)
+        // Also match if roles have same base (e.g., signer matches signer1)
+        if (p.role === recipient.roleName) return true;
+        if (recipient.roleName.startsWith(p.role) || p.role.startsWith(recipient.roleName)) return true;
+        return false;
+      }
     );
 
     return {
@@ -105,10 +113,9 @@ export const signingRoutes: FastifyPluginAsync = async (fastify) => {
         name: recipient.packet.name,
         status: recipient.packet.status,
       },
-      template: {
-        id: recipient.packet.template.id,
-        name: recipient.packet.template.name,
-        filePath: `/uploads/${recipient.packet.template.filePath}`,
+      document: {
+        fileName: recipient.packet.fileName,
+        filePath: `/uploads/${recipient.packet.filePath}`,
       },
       placeholders: recipientPlaceholders,
       signers: recipient.packet.recipients.map(r => ({
@@ -149,7 +156,6 @@ export const signingRoutes: FastifyPluginAsync = async (fastify) => {
       include: {
         packet: {
           include: {
-            template: true,
             recipients: {
               orderBy: { order: 'asc' },
               include: {
@@ -229,13 +235,13 @@ export const signingRoutes: FastifyPluginAsync = async (fastify) => {
 
     if (allSigned) {
       // All signatures collected - stamp PDF and complete
-      const templatePath = path.join(
+      const documentPath = path.join(
         process.cwd(),
         'uploads',
-        recipient.packet.template.filePath
+        recipient.packet.filePath
       );
 
-      const placeholders = JSON.parse(recipient.packet.template.placeholders as string);
+      const placeholders = JSON.parse(recipient.packet.placeholders as string);
 
       // Build stamp configs for all signers
       const stamps = allRecipients.map(r => ({
@@ -252,7 +258,7 @@ export const signingRoutes: FastifyPluginAsync = async (fastify) => {
       }));
 
       // Stamp the PDF
-      const stampedPdf = await stampSignature(templatePath, stamps, placeholders);
+      const stampedPdf = await stampSignature(documentPath, stamps, placeholders);
       const signedPdfPath = await saveStampedPdf(stampedPdf, recipient.packetId);
 
       // Update packet
@@ -357,16 +363,14 @@ export const signingRoutes: FastifyPluginAsync = async (fastify) => {
     }
   });
 
-  // Download template PDF for preview
+  // Download document PDF for preview
   fastify.get<{ Params: { token: string } }>('/:token/pdf', async (request, reply) => {
     const { token } = request.params;
 
     const recipient = await prisma.recipient.findUnique({
       where: { token },
       include: {
-        packet: {
-          include: { template: true },
-        },
+        packet: true,
       },
     });
 
@@ -377,14 +381,14 @@ export const signingRoutes: FastifyPluginAsync = async (fastify) => {
     const filePath = path.join(
       process.cwd(),
       'uploads',
-      recipient.packet.template.filePath
+      recipient.packet.filePath
     );
 
     try {
       const pdfBuffer = await fs.readFile(filePath);
       return reply
         .header('Content-Type', 'application/pdf')
-        .header('Content-Disposition', `inline; filename="${recipient.packet.template.fileName}"`)
+        .header('Content-Disposition', `inline; filename="${recipient.packet.fileName}"`)
         .send(pdfBuffer);
     } catch (err) {
       return reply.status(404).send({ error: 'PDF not found' });

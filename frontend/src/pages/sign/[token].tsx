@@ -18,7 +18,7 @@ export default function SigningPage() {
 
   // Form state
   const [signatureData, setSignatureData] = useState<string | null>(null);
-  const [signatureType, setSignatureType] = useState<'drawn' | 'typed'>('draw');
+  const [signatureType, setSignatureType] = useState<'drawn' | 'typed'>('drawn');
   const [typedName, setTypedName] = useState('');
   const [textFields, setTextFields] = useState<Record<string, string>>({});
   const [confirmed, setConfirmed] = useState(false);
@@ -38,15 +38,23 @@ export default function SigningPage() {
       // Pre-fill name
       setTypedName(data.recipient.name);
 
-      // Initialize text fields
+      // Initialize text fields (including DATE fields which get fieldName like 'Dte1')
       const textPlaceholders = data.placeholders.filter(
         (p: Placeholder) => p.type === 'TEXT'
+      );
+      const datePlaceholders = data.placeholders.filter(
+        (p: Placeholder) => p.type === 'DATE'
       );
       const initialTextFields: Record<string, string> = {};
       textPlaceholders.forEach((p: Placeholder) => {
         if (p.fieldName) {
           initialTextFields[p.fieldName] = '';
         }
+      });
+      // Also add date fields - use fieldName or a generated key
+      datePlaceholders.forEach((p: Placeholder, idx: number) => {
+        const fieldKey = p.fieldName || `date_${idx}`;
+        initialTextFields[fieldKey] = new Date().toLocaleDateString('en-US');
       });
       setTextFields(initialTextFields);
     } catch (err) {
@@ -178,6 +186,7 @@ export default function SigningPage() {
   if (!session) return null;
 
   const textPlaceholders = session.placeholders.filter((p) => p.type === 'TEXT');
+  const datePlaceholders = session.placeholders.filter((p) => p.type === 'DATE');
 
   return (
     <>
@@ -268,17 +277,40 @@ export default function SigningPage() {
                   />
                 </div>
 
-                {/* Text fields */}
-                {textPlaceholders.length > 0 && (
+                {/* Text fields and Date fields */}
+                {(textPlaceholders.length > 0 || datePlaceholders.length > 0) && (
                   <div>
                     <h3 className="font-medium text-gray-900 mb-4">
-                      Additional Information
+                      Required Information
                     </h3>
                     <div className="space-y-4">
+                      {/* Date fields */}
+                      {datePlaceholders.map((placeholder, idx) => {
+                        const fieldKey = placeholder.fieldName || `date_${idx}`;
+                        return (
+                          <div key={fieldKey}>
+                            <label className="label">
+                              Date
+                            </label>
+                            <input
+                              type="date"
+                              value={textFields[fieldKey] ? new Date(textFields[fieldKey]).toISOString().split('T')[0] : ''}
+                              onChange={(e) =>
+                                setTextFields({
+                                  ...textFields,
+                                  [fieldKey]: e.target.value ? new Date(e.target.value).toLocaleDateString('en-US') : '',
+                                })
+                              }
+                              className="input"
+                            />
+                          </div>
+                        );
+                      })}
+                      {/* Text fields */}
                       {textPlaceholders.map((placeholder) => (
                         <div key={placeholder.fieldName}>
                           <label className="label capitalize">
-                            {placeholder.fieldName?.replace(/_/g, ' ')}
+                            {placeholder.fieldName?.replace(/_/g, ' ').replace(/#/g, ' #')}
                           </label>
                           <input
                             type="text"
@@ -290,6 +322,7 @@ export default function SigningPage() {
                               })
                             }
                             className="input"
+                            placeholder={`Enter ${placeholder.fieldName?.replace(/_/g, ' ')}`}
                           />
                         </div>
                       ))}

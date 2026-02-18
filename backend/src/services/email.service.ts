@@ -18,6 +18,9 @@ const smtpTransporter = nodemailer.createTransport({
   } : undefined,
 });
 
+// Log SMTP configuration on startup (without password)
+console.log(`[Email] SMTP configured: ${config.SMTP_HOST}:${config.SMTP_PORT}, user: ${config.SMTP_USER || '(none)'}, secure: ${config.SMTP_SECURE}`);
+
 interface EmailOptions {
   to: string;
   subject: string;
@@ -54,18 +57,34 @@ export async function sendEmail(options: EmailOptions): Promise<void> {
       })),
     });
   } else {
-    await smtpTransporter.sendMail({
-      from: `"${config.EMAIL_FROM_NAME}" <${config.EMAIL_FROM}>`,
-      to,
-      subject,
-      text,
-      html,
-      attachments: attachments?.map(a => ({
-        filename: a.filename,
-        content: a.content,
-        contentType: a.contentType,
-      })),
-    });
+    try {
+      console.log(`[Email] Sending email to: ${to}, subject: "${subject}"`);
+      const result = await smtpTransporter.sendMail({
+        from: `"${config.EMAIL_FROM_NAME}" <${config.EMAIL_FROM}>`,
+        to,
+        subject,
+        text,
+        html,
+        attachments: attachments?.map(a => ({
+          filename: a.filename,
+          content: a.content,
+          contentType: a.contentType,
+        })),
+      });
+      console.log(`[Email] Email sent successfully! Message ID: ${result.messageId}`);
+    } catch (err: any) {
+      console.error(`[Email] Failed to send email:`, err.message);
+      // In development, log email details instead of failing if SMTP isn't available
+      if (err.code === 'ESOCKET' || err.code === 'ECONNREFUSED') {
+        console.log('\n========== EMAIL (SMTP unavailable - logged for dev) ==========');
+        console.log(`To: ${to}`);
+        console.log(`Subject: ${subject}`);
+        console.log(`Text:\n${text}`);
+        console.log('================================================================\n');
+        return; // Don't throw in dev mode when SMTP is unavailable
+      }
+      throw err;
+    }
   }
 }
 
