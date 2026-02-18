@@ -8,11 +8,11 @@ export const userRoutes: FastifyPluginAsync = async (fastify) => {
 
   // GET /documents - user's assigned documents (matched by email)
   fastify.get('/documents', async (request) => {
-    const user = request.user!;
+    const currentUser = request.currentUser!;
 
     // Find recipients that match the user's email
     const recipients = await prisma.recipient.findMany({
-      where: { email: user.email },
+      where: { email: currentUser.email },
       include: {
         packet: {
           select: {
@@ -41,13 +41,13 @@ export const userRoutes: FastifyPluginAsync = async (fastify) => {
   fastify.get<{ Params: { id: string } }>(
     '/documents/:id/sign-url',
     async (request, reply) => {
-      const user = request.user!;
+      const currentUser = request.currentUser!;
       const { id } = request.params;
 
       const recipient = await prisma.recipient.findFirst({
         where: {
           id,
-          email: user.email,
+          email: currentUser.email,
         },
       });
 

@@ -1,9 +1,10 @@
 import { FastifyRequest, FastifyReply } from 'fastify';
 import { authService } from '../services/auth.service.js';
 
+// Extend FastifyRequest with our user type
 declare module 'fastify' {
   interface FastifyRequest {
-    user?: {
+    currentUser?: {
       id: string;
       email: string;
       name: string;
@@ -38,7 +39,7 @@ export async function requireAuth(
       return reply.status(403).send({ error: 'Account is disabled' });
     }
 
-    request.user = {
+    request.currentUser = {
       id: user.id,
       email: user.email,
       name: user.name,
@@ -58,7 +59,7 @@ export async function requireAdmin(
 
   if (reply.sent) return;
 
-  if (request.user?.role !== 'admin') {
+  if (request.currentUser?.role !== 'admin') {
     return reply.status(403).send({ error: 'Admin access required' });
   }
 }

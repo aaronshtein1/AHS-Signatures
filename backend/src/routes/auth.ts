@@ -65,6 +65,6 @@ export async function authRoutes(fastify: FastifyInstance) {
 
   // GET /api/auth/me - Get current user info
   fastify.get('/me', { preHandler: [requireAuth] }, async (request, reply) => {
-    return reply.send({ user: request.user });
+    return reply.send({ user: request.currentUser });
   });
 }
