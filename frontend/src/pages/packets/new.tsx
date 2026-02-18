@@ -1,14 +1,15 @@
-import { useState, useRef } from 'react';
+import { useState, useRef, useEffect } from 'react';
 import { useRouter } from 'next/router';
 import Layout from '@/components/Layout';
 import ProtectedRoute from '@/components/ProtectedRoute';
-import { packets } from '@/lib/api';
+import { packets, admin, User } from '@/lib/api';
 
 interface RecipientInput {
   roleName: string;
   name: string;
   email: string;
   order: number;
+  userId?: string; // Track if selected from user list
 }
 
 function NewPacketContent() {
@@ -19,6 +20,10 @@ function NewPacketContent() {
   const [file, setFile] = useState<File | null>(null);
   const [dragActive, setDragActive] = useState(false);
 
+  // Users list for selection
+  const [users, setUsers] = useState<User[]>([]);
+  const [usersLoading, setUsersLoading] = useState(true);
+
   // Form state
   const [name, setName] = useState('');
   const [recipients, setRecipients] = useState<RecipientInput[]>([
@@ -26,6 +31,14 @@ function NewPacketContent() {
   ]);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  // Load users on mount
+  useEffect(() => {
+    admin.users()
+      .then(setUsers)
+      .catch(() => {}) // Silently fail if can't load users
+      .finally(() => setUsersLoading(false));
+  }, []);
 
   const handleFileSelect = (selectedFile: File) => {
     if (selectedFile.type !== 'application/pdf') {
@@ -74,7 +87,25 @@ function NewPacketContent() {
   const updateRecipient = (index: number, field: keyof RecipientInput, value: string | number) => {
     const updated = [...recipients];
     updated[index] = { ...updated[index], [field]: value };
+    // Clear userId if manually editing name/email
+    if (field === 'name' || field === 'email') {
+      updated[index].userId = undefined;
+    }
     setRecipients(updated);
+  };
+
+  const selectUser = (index: number, userId: string) => {
+    const user = users.find(u => u.id === userId);
+    if (user) {
+      const updated = [...recipients];
+      updated[index] = {
+        ...updated[index],
+        name: user.name,
+        email: user.email,
+        userId: user.id,
+      };
+      setRecipients(updated);
+    }
   };
 
   const moveRecipient = (index: number, direction: 'up' | 'down') => {
@@ -321,6 +352,32 @@ function NewPacketContent() {
                       )}
                     </div>
                   </div>
+                  {/* User Selection */}
+                  {users.length > 0 && (
+                    <div className="mb-3">
+                      <label className="label">Select User (Optional)</label>
+                      <select
+                        value={recipient.userId || ''}
+                        onChange={(e) => {
+                          if (e.target.value) {
+                            selectUser(index, e.target.value);
+                          } else {
+                            // Clear selection
+                            updateRecipient(index, 'name', '');
+                            updateRecipient(index, 'email', '');
+                          }
+                        }}
+                        className="input"
+                      >
+                        <option value="">-- Enter manually --</option>
+                        {users.map((user) => (
+                          <option key={user.id} value={user.id}>
+                            {user.name} ({user.email})
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                  )}
                   <div className="grid grid-cols-2 gap-4">
                     <div>
                       <label className="label">Full Name</label>
@@ -331,6 +388,7 @@ function NewPacketContent() {
                         placeholder="John Doe"
                         className="input"
                         required
+                        disabled={!!recipient.userId}
                       />
                     </div>
                     <div>
@@ -342,6 +400,7 @@ function NewPacketContent() {
                         placeholder="john@example.com"
                         className="input"
                         required
+                        disabled={!!recipient.userId}
                       />
                     </div>
                   </div>
