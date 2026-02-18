@@ -41,10 +41,10 @@ export default function LoginPage() {
 
   const fillDemoCredentials = (role: 'admin' | 'user') => {
     if (role === 'admin') {
-      setEmail('admin@demo.com');
+      setEmail('admin@example.com');
       setPassword('admin123');
     } else {
-      setEmail('user@demo.com');
+      setEmail('user@example.com');
       setPassword('user123');
     }
   };
@@ -86,7 +86,7 @@ export default function LoginPage() {
                 className="w-full text-left px-3 py-2 bg-white rounded border border-blue-200 hover:bg-blue-50 transition-colors"
               >
                 <span className="font-medium text-blue-700">Admin:</span>{' '}
-                <span className="text-gray-600">admin@demo.com / admin123</span>
+                <span className="text-gray-600">admin@example.com / admin123</span>
               </button>
               <button
                 type="button"
@@ -94,7 +94,7 @@ export default function LoginPage() {
                 className="w-full text-left px-3 py-2 bg-white rounded border border-blue-200 hover:bg-blue-50 transition-colors"
               >
                 <span className="font-medium text-blue-700">User:</span>{' '}
-                <span className="text-gray-600">user@demo.com / user123</span>
+                <span className="text-gray-600">user@example.com / user123</span>
               </button>
             </div>
           </div>
