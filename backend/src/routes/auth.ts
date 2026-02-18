@@ -39,8 +39,16 @@ export async function authRoutes(fastify: FastifyInstance) {
         { expiresIn: config.JWT_EXPIRES_IN }
       );
 
+      // Set JWT as HTTP-only cookie
+      reply.setCookie('token', token, {
+        httpOnly: true,
+        secure: true, // Required for sameSite: 'none'
+        sameSite: 'none', // Required for cross-origin cookies
+        path: '/',
+        maxAge: 60 * 60 * 24, // 24 hours
+      });
+
       return reply.send({
-        token,
         user: {
           id: user.id,
           email: user.email,
@@ -56,11 +64,14 @@ export async function authRoutes(fastify: FastifyInstance) {
     }
   });
 
-  // POST /api/auth/logout - Logout (client-side token removal)
-  fastify.post('/logout', { preHandler: [requireAuth] }, async (request, reply) => {
-    // JWT is stateless, so logout is handled client-side by removing the token
-    // This endpoint exists for API completeness and potential future token blacklisting
-    return reply.send({ message: 'Logged out successfully' });
+  // POST /api/auth/logout - Clear the auth cookie
+  fastify.post('/logout', async (request, reply) => {
+    reply.clearCookie('token', {
+      path: '/',
+      secure: true,
+      sameSite: 'none',
+    });
+    return reply.send({ success: true });
   });
 
   // GET /api/auth/me - Get current user info

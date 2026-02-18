@@ -33,13 +33,17 @@ async function main() {
     allowedHeaders: ['Content-Type', 'Authorization'],
   });
 
-  // JWT authentication
+  // Cookie support (must be registered before JWT)
+  await fastify.register(fastifyCookie);
+
+  // JWT authentication with cookie support
   await fastify.register(fastifyJwt, {
     secret: config.JWT_SECRET,
+    cookie: {
+      cookieName: 'token',
+      signed: false,
+    },
   });
-
-  // Cookie support
-  await fastify.register(fastifyCookie);
 
   await fastify.register(multipart, {
     attachFieldsToBody: true,
