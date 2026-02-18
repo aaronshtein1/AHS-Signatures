@@ -22,10 +22,12 @@ signed/
 # IDE
 .vscode/
 .idea/
+.claude/
 
 # OS
 .DS_Store
 Thumbs.db
+nul
 
 # Logs
 *.log
@@ -33,6 +35,20 @@ npm-debug.log*
 
 # Testing
 coverage/
+
+# Test PDFs
+test*.pdf
+SIGNED-*.pdf
+
+# Compiled TypeScript in prisma
+backend/prisma/*.js
+backend/prisma/*.js.map
+backend/prisma/*.d.ts
+backend/prisma/*.d.ts.map
+
+# Agent prompts (dev only)
+AGENT_*.md
+AGENT_COORDINATION.md
 
 # Misc
 *.tgz
