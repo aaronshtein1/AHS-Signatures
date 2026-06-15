@@ -5,6 +5,7 @@ interface StatusBadgeProps {
 
 const statusConfig: Record<string, { bg: string; text: string; label: string }> = {
   draft: { bg: 'bg-gray-100', text: 'text-gray-700', label: 'Draft' },
+  pending_assignment: { bg: 'bg-orange-100', text: 'text-orange-700', label: 'Unassigned' },
   sent: { bg: 'bg-blue-100', text: 'text-blue-700', label: 'Sent' },
   in_progress: { bg: 'bg-yellow-100', text: 'text-yellow-700', label: 'In Progress' },
   completed: { bg: 'bg-green-100', text: 'text-green-700', label: 'Completed' },

@@ -27,5 +27,5 @@ RUN mkdir -p uploads/templates uploads/packets uploads/signatures signed data
 # Expose port
 EXPOSE 3001
 
-# Run migrations and start server
-CMD npx prisma migrate deploy && npm start
+# Run migrations, seed (idempotent upsert), and start server
+CMD npx prisma migrate deploy && npx tsx prisma/seed.ts && npm start

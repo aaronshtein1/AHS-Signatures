@@ -4,9 +4,11 @@ import { isTokenExpired, generateSecureToken, getTokenExpiryDate, generateSignin
 import { stampSignature, saveStampedPdf, Placeholder } from '../services/pdf.service.js';
 import { sendSigningRequest, sendCompletionEmail } from '../services/email.service.js';
 import { z } from 'zod';
+import crypto from 'crypto';
 import fs from 'fs/promises';
 import path from 'path';
 import { config } from '../utils/config.js';
+import { uploadToSharePoint, isSharePointConfigured } from '../services/sharepoint.service.js';
 
 const signDocumentSchema = z.object({
   signatureData: z.string().min(1), // Base64 image or typed text
@@ -14,6 +16,8 @@ const signDocumentSchema = z.object({
   typedName: z.string().min(1),
   textFields: z.record(z.string()).optional(),
   confirmed: z.boolean(),
+  attestationAcknowledged: z.boolean(),
+  attestationText: z.string().min(1),
 });
 
 export const signingRoutes: FastifyPluginAsync = async (fastify) => {
@@ -143,11 +147,17 @@ export const signingRoutes: FastifyPluginAsync = async (fastify) => {
       });
     }
 
-    const { signatureData, signatureType, typedName, textFields, confirmed } = validation.data;
+    const { signatureData, signatureType, typedName, textFields, confirmed, attestationAcknowledged, attestationText } = validation.data;
 
     if (!confirmed) {
       return reply.status(400).send({
         error: 'You must confirm you are the intended signer',
+      });
+    }
+
+    if (!attestationAcknowledged) {
+      return reply.status(400).send({
+        error: 'You must acknowledge the attestation before signing',
       });
     }
 
@@ -190,7 +200,18 @@ export const signingRoutes: FastifyPluginAsync = async (fastify) => {
       });
     }
 
-    // Save signature
+    // Build I-9 compliant identity record
+    const signedAt = new Date();
+    const identityRecord = JSON.stringify({
+      email: recipient.email,
+      name: recipient.name,
+      tokenHash: crypto.createHash('sha256').update(token).digest('hex'),
+      ip: request.ip,
+      userAgent: request.headers['user-agent'],
+      signedAt: signedAt.toISOString(),
+    });
+
+    // Save signature with attestation and identity record
     await prisma.signature.create({
       data: {
         recipientId: recipient.id,
@@ -200,6 +221,8 @@ export const signingRoutes: FastifyPluginAsync = async (fastify) => {
         textFields: textFields ? JSON.stringify(textFields) : null,
         ipAddress: request.ip,
         userAgent: request.headers['user-agent'],
+        attestationText,
+        identityRecord,
       },
     });
 
@@ -208,17 +231,29 @@ export const signingRoutes: FastifyPluginAsync = async (fastify) => {
       where: { id: recipient.id },
       data: {
         status: 'signed',
-        signedAt: new Date(),
+        signedAt,
       },
     });
 
-    // Audit log
+    // Audit log: attestation acknowledged
+    await prisma.auditLog.create({
+      data: {
+        packetId: recipient.packetId,
+        recipientId: recipient.id,
+        action: 'attestation_acknowledged',
+        details: `Attestation acknowledged by ${recipient.name} (${recipient.email})`,
+        ipAddress: request.ip,
+        userAgent: request.headers['user-agent'],
+      },
+    });
+
+    // Audit log: signature affixed
     await prisma.auditLog.create({
       data: {
         packetId: recipient.packetId,
         recipientId: recipient.id,
         action: 'signed',
-        details: `Document signed by ${recipient.name} (${recipient.email})`,
+        details: `Document signed by ${recipient.name} (${recipient.email}) — signature type: ${signatureType}, identity record preserved`,
         ipAddress: request.ip,
         userAgent: request.headers['user-agent'],
       },
@@ -305,6 +340,76 @@ export const signingRoutes: FastifyPluginAsync = async (fastify) => {
         }
       }
 
+      // Upload to SharePoint if configured
+      if (isSharePointConfigured()) {
+        try {
+          // Fetch the full packet to get employee info and form route
+          const fullPacket = await prisma.signingPacket.findUnique({
+            where: { id: recipient.packetId },
+          });
+
+          const employeeName = fullPacket?.employeeName || recipient.packet.name;
+          const signedFileName = `${recipient.packet.name}_signed.pdf`;
+
+          // Get optional subfolder from form route
+          let subfolder: string | null = null;
+          if (fullPacket?.formRouteId) {
+            const formRoute = await prisma.formRoute.findUnique({
+              where: { id: fullPacket.formRouteId },
+            });
+            subfolder = formRoute?.sharepointFolder || null;
+          }
+
+          const uploadResult = await uploadToSharePoint(
+            employeeName,
+            signedFileName,
+            pdfBuffer,
+            subfolder
+          );
+
+          // Store SharePoint info on the packet
+          await prisma.signingPacket.update({
+            where: { id: recipient.packetId },
+            data: {
+              sharepointUrl: uploadResult.url,
+              sharepointFolder: uploadResult.folderName,
+              sharepointError: null,
+            },
+          });
+
+          const matchInfo = uploadResult.isExistingFolder
+            ? `matched existing folder "${uploadResult.folderName}" (${Math.round(uploadResult.matchConfidence * 100)}% confidence)`
+            : `created new folder "${uploadResult.folderName}"`;
+
+          await prisma.auditLog.create({
+            data: {
+              packetId: recipient.packetId,
+              action: 'uploaded',
+              details: `Signed PDF uploaded to SharePoint: ${uploadResult.url} — ${matchInfo}`,
+            },
+          });
+        } catch (err) {
+          console.error('[SharePoint] Failed to upload signed PDF:', err);
+          const errorMsg = err instanceof Error ? err.message : String(err);
+
+          // Store the failure on the packet so admins can see it
+          await prisma.signingPacket.update({
+            where: { id: recipient.packetId },
+            data: {
+              sharepointError: errorMsg,
+            },
+          }).catch(() => {}); // Don't fail if this update also fails
+
+          await prisma.auditLog.create({
+            data: {
+              packetId: recipient.packetId,
+              action: 'upload_failed',
+              details: `SharePoint upload failed: ${errorMsg}`,
+            },
+          }).catch(() => {});
+        }
+      }
+
       return {
         success: true,
         completed: true,
@@ -361,6 +466,57 @@ export const signingRoutes: FastifyPluginAsync = async (fastify) => {
         message: 'Your signature has been recorded',
       };
     }
+  });
+
+  // Get signing confirmation receipt (I-9 compliance: printable confirmation)
+  fastify.get<{ Params: { token: string } }>('/:token/confirmation', async (request, reply) => {
+    const { token } = request.params;
+
+    const recipient = await prisma.recipient.findUnique({
+      where: { token },
+      include: {
+        packet: true,
+        signature: true,
+      },
+    });
+
+    if (!recipient) {
+      return reply.status(404).send({ error: 'Invalid token' });
+    }
+
+    if (!recipient.signature) {
+      return reply.status(400).send({ error: 'No signature found for this token' });
+    }
+
+    const sig = recipient.signature;
+    const identity = sig.identityRecord ? JSON.parse(sig.identityRecord) : null;
+
+    return {
+      confirmationId: sig.id,
+      signer: {
+        name: recipient.name,
+        email: recipient.email,
+        role: recipient.roleName,
+      },
+      document: {
+        name: recipient.packet.name,
+        fileName: recipient.packet.fileName,
+      },
+      signature: {
+        type: sig.signatureType,
+        typedName: sig.typedName,
+        signedAt: recipient.signedAt?.toISOString(),
+      },
+      attestation: {
+        text: sig.attestationText,
+        acknowledgedAt: sig.createdAt.toISOString(),
+      },
+      identity: identity || {
+        ip: sig.ipAddress,
+        userAgent: sig.userAgent,
+        signedAt: sig.createdAt.toISOString(),
+      },
+    };
   });
 
   // Download document PDF for preview

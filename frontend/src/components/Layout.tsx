@@ -16,10 +16,12 @@ export default function Layout({ children }: LayoutProps) {
     router.push('/login');
   };
 
-  // Admin navigation items
+  // Admin navigation items - includes My Documents so admins can sign too
   const adminNavItems = [
     { href: '/', label: 'Dashboard' },
     { href: '/packets', label: 'Packets' },
+    { href: '/my-documents', label: 'My Documents' },
+    { href: '/form-routes', label: 'Form Routes' },
   ];
 
   // User navigation items

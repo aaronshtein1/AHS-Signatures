@@ -22,39 +22,63 @@ async function main() {
   }
   console.log('Created upload directories');
 
-  // Create demo admin user
-  const adminPassword = await hashPassword('admin123');
+  // --- Admin user setup ---
+  // In production: use ADMIN_SEED_EMAIL / ADMIN_SEED_PASSWORD env vars
+  // In development: fall back to demo credentials
+  const isProduction = process.env.NODE_ENV === 'production';
+
+  const adminEmail = process.env.ADMIN_SEED_EMAIL || (isProduction ? '' : 'admin@example.com');
+  const adminPassword = process.env.ADMIN_SEED_PASSWORD || (isProduction ? '' : 'admin123');
+  const adminName = process.env.ADMIN_SEED_NAME || 'Admin';
+
+  if (!adminEmail || !adminPassword) {
+    console.error(
+      'ERROR: In production, you must set ADMIN_SEED_EMAIL and ADMIN_SEED_PASSWORD.\n' +
+      'These environment variables define the initial admin account.'
+    );
+    process.exit(1);
+  }
+
+  if (isProduction && adminPassword.length < 12) {
+    console.error('ERROR: ADMIN_SEED_PASSWORD must be at least 12 characters in production.');
+    process.exit(1);
+  }
+
+  const adminHash = await hashPassword(adminPassword);
   const admin = await prisma.user.upsert({
-    where: { email: 'admin@example.com' },
+    where: { email: adminEmail.toLowerCase() },
     update: {},
     create: {
-      email: 'admin@example.com',
-      passwordHash: adminPassword,
-      name: 'Admin User',
+      email: adminEmail.toLowerCase(),
+      passwordHash: adminHash,
+      name: adminName,
       role: 'admin',
       isActive: true,
     },
   });
-  console.log(`Created admin user: ${admin.email}`);
+  console.log(`Admin user ready: ${admin.email}`);
 
-  // Create demo regular user
-  const userPassword = await hashPassword('user123');
-  const user = await prisma.user.upsert({
-    where: { email: 'user@example.com' },
-    update: {},
-    create: {
-      email: 'user@example.com',
-      passwordHash: userPassword,
-      name: 'Demo User',
-      role: 'user',
-      isActive: true,
-    },
-  });
-  console.log(`Created regular user: ${user.email}`);
+  // In development only, create a demo regular user
+  if (!isProduction) {
+    const userPassword = await hashPassword('user123');
+    const user = await prisma.user.upsert({
+      where: { email: 'user@example.com' },
+      update: {},
+      create: {
+        email: 'user@example.com',
+        passwordHash: userPassword,
+        name: 'Demo User',
+        role: 'user',
+        isActive: true,
+      },
+    });
+    console.log(`Demo user ready: ${user.email}`);
 
-  console.log('\nDemo credentials:');
-  console.log('  Admin: admin@example.com / admin123');
-  console.log('  User:  user@example.com / user123');
+    console.log('\nDev credentials:');
+    console.log('  Admin: admin@example.com / admin123');
+    console.log('  User:  user@example.com / user123');
+  }
+
   console.log('\nSeeding complete!');
 }
 

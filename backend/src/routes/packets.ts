@@ -25,15 +25,89 @@ export const packetRoutes: FastifyPluginAsync = async (fastify) => {
   // Protect all packet routes - admin only
   fastify.addHook('preHandler', requireAdmin);
 
+  // Bulk assign unassigned packets to a signer
+  fastify.post('/bulk-assign', async (request, reply) => {
+    const bulkSchema = z.object({
+      packetIds: z.array(z.string()).min(1),
+      signerName: z.string().min(1),
+      signerEmail: z.string().email(),
+      signerRole: z.string().min(1).optional(),
+    });
+
+    const validation = bulkSchema.safeParse(request.body);
+    if (!validation.success) {
+      return reply.status(400).send({ error: 'Validation failed', details: validation.error.errors });
+    }
+
+    const { packetIds, signerName, signerEmail, signerRole = 'countersigner' } = validation.data;
+
+    const packetsToAssign = await prisma.signingPacket.findMany({
+      where: { id: { in: packetIds }, status: 'pending_assignment' },
+    });
+
+    if (packetsToAssign.length === 0) {
+      return reply.status(400).send({ error: 'No packets found in pending_assignment status' });
+    }
+
+    let assigned = 0;
+    const errors: string[] = [];
+
+    for (const packet of packetsToAssign) {
+      try {
+        const token = generateSecureToken();
+        const tokenExpiresAt = getTokenExpiryDate();
+
+        const recipient = await prisma.recipient.create({
+          data: {
+            packetId: packet.id,
+            roleName: signerRole,
+            name: signerName,
+            email: signerEmail,
+            order: 1,
+            token,
+            tokenExpiresAt,
+            status: 'notified',
+          },
+        });
+
+        await prisma.signingPacket.update({
+          where: { id: packet.id },
+          data: { status: 'sent' },
+        });
+
+        const signingUrl = generateSigningUrl(token);
+        await sendSigningRequest(signerEmail, signerName, packet.name, signingUrl, tokenExpiresAt);
+
+        await prisma.auditLog.create({
+          data: {
+            packetId: packet.id,
+            recipientId: recipient.id,
+            action: 'assigned',
+            details: `Assigned to ${signerName} (${signerEmail})`,
+          },
+        });
+
+        assigned++;
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        errors.push(`Packet ${packet.id}: ${msg}`);
+      }
+    }
+
+    return { success: true, assigned, total: packetIds.length, errors };
+  });
+
   // List all packets
   fastify.get<{
-    Querystring: { status?: string };
+    Querystring: { status?: string; county?: string; formRouteId?: string };
   }>('/', async (request, reply) => {
-    const { status } = request.query;
+    const { status, county, formRouteId } = request.query;
 
     const packets = await prisma.signingPacket.findMany({
       where: {
         ...(status && { status }),
+        ...(county && { county: { contains: county } }),
+        ...(formRouteId && { formRouteId }),
       },
       orderBy: { createdAt: 'desc' },
       include: {
@@ -458,6 +532,75 @@ export const packetRoutes: FastifyPluginAsync = async (fastify) => {
     await prisma.signingPacket.delete({ where: { id } });
 
     return { success: true };
+  });
+
+  // Reassign a pending/notified recipient to a different person
+  fastify.post<{
+    Params: { id: string; recipientId: string };
+    Body: { name: string; email: string };
+  }>('/:id/recipients/:recipientId/reassign', async (request, reply) => {
+    const { id, recipientId } = request.params;
+    const { name, email } = request.body as { name: string; email: string };
+
+    if (!name || !email) {
+      return reply.status(400).send({ error: 'Name and email are required' });
+    }
+
+    const packet = await prisma.signingPacket.findUnique({
+      where: { id },
+      include: { recipients: { orderBy: { order: 'asc' } } },
+    });
+
+    if (!packet) {
+      return reply.status(404).send({ error: 'Packet not found' });
+    }
+
+    if (packet.status === 'completed' || packet.status === 'cancelled') {
+      return reply.status(400).send({ error: 'Packet is no longer active' });
+    }
+
+    const recipient = packet.recipients.find(r => r.id === recipientId);
+    if (!recipient) {
+      return reply.status(404).send({ error: 'Recipient not found' });
+    }
+
+    if (recipient.status === 'signed') {
+      return reply.status(400).send({ error: 'Cannot reassign a recipient who has already signed' });
+    }
+
+    const oldName = recipient.name;
+    const oldEmail = recipient.email;
+
+    // Generate new token and update recipient
+    const token = generateSecureToken();
+    const tokenExpiresAt = getTokenExpiryDate();
+
+    await prisma.recipient.update({
+      where: { id: recipientId },
+      data: {
+        name,
+        email,
+        token,
+        tokenExpiresAt,
+        status: 'notified',
+      },
+    });
+
+    // Send signing email to new person
+    const signingUrl = generateSigningUrl(token);
+    await sendSigningRequest(email, name, packet.name, signingUrl, tokenExpiresAt);
+
+    // Audit log
+    await prisma.auditLog.create({
+      data: {
+        packetId: id,
+        recipientId,
+        action: 'reassigned',
+        details: `Reassigned from ${oldName} (${oldEmail}) to ${name} (${email})`,
+      },
+    });
+
+    return { success: true, message: `Reassigned to ${name} and sent signing request` };
   });
 
   // Get packet timeline/audit log

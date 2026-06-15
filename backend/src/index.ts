@@ -4,6 +4,7 @@ import fastifyJwt from '@fastify/jwt';
 import fastifyCookie from '@fastify/cookie';
 import multipart from '@fastify/multipart';
 import fastifyStatic from '@fastify/static';
+import rateLimit from '@fastify/rate-limit';
 import path from 'path';
 import { config } from './utils/config.js';
 import { authRoutes } from './routes/auth.js';
@@ -11,12 +12,23 @@ import { packetRoutes } from './routes/packets.js';
 import { signingRoutes } from './routes/signing.js';
 import { adminRoutes } from './routes/admin.js';
 import { userRoutes } from './routes/user.js';
+import { webhookRoutes } from './routes/webhook.js';
+import { formRouteRoutes } from './routes/form-routes.js';
+import { googleDriveRoutes } from './routes/google-drive.js';
 
 const fastify = Fastify({
   logger: true,
 });
 
 async function main() {
+  // --- Production safety checks ---
+  if (process.env.NODE_ENV === 'production') {
+    if (!process.env.JWT_SECRET || process.env.JWT_SECRET === 'change-this-secret-in-production') {
+      console.error('FATAL: JWT_SECRET must be set to a secure value in production');
+      process.exit(1);
+    }
+  }
+
   // CORS: Add headers to ALL responses including errors
   fastify.addHook('onSend', async (request, reply) => {
     reply.header('Access-Control-Allow-Origin', config.CORS_ORIGIN);
@@ -31,6 +43,12 @@ async function main() {
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization'],
+  });
+
+  // Rate limiting — global default, stricter on public endpoints
+  await fastify.register(rateLimit, {
+    max: 100,         // 100 requests per minute for authenticated routes
+    timeWindow: '1 minute',
   });
 
   // Cookie support (must be registered before JWT)
@@ -71,12 +89,24 @@ async function main() {
     return { status: 'ok', timestamp: new Date().toISOString() };
   });
 
-  // Register routes
-  await fastify.register(authRoutes, { prefix: '/api/auth' });
+  // Register routes — apply stricter rate limits to public-facing endpoints
+  await fastify.register(async function authPlugin(app) {
+    app.register(rateLimit, { max: 10, timeWindow: '1 minute' }); // Brute-force protection
+    app.register(authRoutes);
+  }, { prefix: '/api/auth' });
   await fastify.register(userRoutes, { prefix: '/api/user' });
   await fastify.register(packetRoutes, { prefix: '/api/packets' });
-  await fastify.register(signingRoutes, { prefix: '/api/signing' });
+  await fastify.register(async function signingPlugin(app) {
+    app.register(rateLimit, { max: 30, timeWindow: '1 minute' }); // Public signing
+    app.register(signingRoutes);
+  }, { prefix: '/api/signing' });
   await fastify.register(adminRoutes, { prefix: '/api/admin' });
+  await fastify.register(async function webhookPlugin(app) {
+    app.register(rateLimit, { max: 20, timeWindow: '1 minute' }); // Webhook protection
+    app.register(webhookRoutes);
+  }, { prefix: '/api/webhooks' });
+  await fastify.register(formRouteRoutes, { prefix: '/api/admin/form-routes' });
+  await fastify.register(googleDriveRoutes, { prefix: '/api/admin/google' });
 
   // Create upload directories if they don't exist
   const fs = await import('fs');

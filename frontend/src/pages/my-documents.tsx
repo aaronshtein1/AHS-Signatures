@@ -35,19 +35,9 @@ function MyDocumentsContent() {
     }
   };
 
-  const getStatusBadge = (status: string) => {
-    const styles: Record<string, string> = {
-      pending: 'bg-yellow-100 text-yellow-800',
-      notified: 'bg-blue-100 text-blue-800',
-      signed: 'bg-green-100 text-green-800',
-      skipped: 'bg-gray-100 text-gray-800',
-    };
-    return (
-      <span className={`px-2 py-1 text-xs font-medium rounded-full ${styles[status] || 'bg-gray-100 text-gray-800'}`}>
-        {status.charAt(0).toUpperCase() + status.slice(1)}
-      </span>
-    );
-  };
+  const pendingDocs = documents.filter(d => d.canSign);
+  const signedDocs = documents.filter(d => d.status === 'signed');
+  const waitingDocs = documents.filter(d => !d.canSign && d.status !== 'signed');
 
   if (loading) {
     return (
@@ -62,11 +52,11 @@ function MyDocumentsContent() {
       <Head>
         <title>My Documents - AHS Signatures</title>
       </Head>
-      <div className="max-w-4xl mx-auto">
-        <h1 className="text-2xl font-bold text-gray-900 mb-6">My Documents</h1>
+      <div className="max-w-4xl mx-auto space-y-6">
+        <h1 className="text-2xl font-bold text-gray-900">My Documents</h1>
 
         {error && (
-          <div className="mb-4 bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded">
+          <div className="bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded-lg">
             {error}
           </div>
         )}
@@ -88,70 +78,106 @@ function MyDocumentsContent() {
             </svg>
             <h3 className="mt-2 text-sm font-medium text-gray-900">No documents</h3>
             <p className="mt-1 text-sm text-gray-500">
-              You don't have any documents assigned for signature yet.
+              You don&apos;t have any documents assigned for signature yet.
             </p>
           </div>
         ) : (
-          <div className="bg-white shadow rounded-lg overflow-hidden">
-            <table className="min-w-full divide-y divide-gray-200">
-              <thead className="bg-gray-50">
-                <tr>
-                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                    Document
-                  </th>
-                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                    Role
-                  </th>
-                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                    Status
-                  </th>
-                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                    Date
-                  </th>
-                  <th className="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">
-                    Actions
-                  </th>
-                </tr>
-              </thead>
-              <tbody className="bg-white divide-y divide-gray-200">
-                {documents.map((doc) => (
-                  <tr key={doc.id} className="hover:bg-gray-50">
-                    <td className="px-6 py-4 whitespace-nowrap">
-                      <div className="text-sm font-medium text-gray-900">
-                        {doc.packet.name}
-                      </div>
-                      <div className="text-sm text-gray-500">{doc.packet.fileName}</div>
-                    </td>
-                    <td className="px-6 py-4 whitespace-nowrap">
-                      <div className="text-sm text-gray-900">{doc.roleName}</div>
-                    </td>
-                    <td className="px-6 py-4 whitespace-nowrap">
-                      {getStatusBadge(doc.status)}
-                    </td>
-                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
-                      {doc.signedAt
-                        ? new Date(doc.signedAt).toLocaleDateString()
-                        : new Date(doc.packet.createdAt).toLocaleDateString()}
-                    </td>
-                    <td className="px-6 py-4 whitespace-nowrap text-right text-sm font-medium">
-                      {doc.canSign ? (
+          <>
+            {/* Action Required - Pending Signatures */}
+            {pendingDocs.length > 0 && (
+              <div>
+                <div className="flex items-center gap-2 mb-3">
+                  <span className="flex h-3 w-3 relative">
+                    <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-orange-400 opacity-75"></span>
+                    <span className="relative inline-flex rounded-full h-3 w-3 bg-orange-500"></span>
+                  </span>
+                  <h2 className="text-lg font-semibold text-gray-900">
+                    Action Required ({pendingDocs.length})
+                  </h2>
+                </div>
+                <div className="space-y-3">
+                  {pendingDocs.map((doc) => (
+                    <div
+                      key={doc.id}
+                      className="bg-white border-l-4 border-orange-500 rounded-lg shadow-sm p-4 hover:shadow-md transition-shadow"
+                    >
+                      <div className="flex items-center justify-between">
+                        <div className="flex-1 min-w-0">
+                          <h3 className="text-sm font-semibold text-gray-900 truncate">
+                            {doc.packet.name}
+                          </h3>
+                          <p className="text-xs text-gray-500 mt-0.5">
+                            {doc.packet.fileName} &middot; Role: {doc.roleName}
+                          </p>
+                          <p className="text-xs text-gray-400 mt-0.5">
+                            Received {new Date(doc.packet.createdAt).toLocaleDateString()}
+                          </p>
+                        </div>
                         <button
                           onClick={() => handleSign(doc)}
-                          className="text-blue-600 hover:text-blue-900"
+                          className="ml-4 px-5 py-2 bg-orange-500 text-white text-sm font-medium rounded-lg hover:bg-orange-600 transition-colors flex-shrink-0"
                         >
                           Sign Now
                         </button>
-                      ) : doc.status === 'signed' ? (
-                        <span className="text-green-600">Signed</span>
-                      ) : (
-                        <span className="text-gray-400">Waiting</span>
-                      )}
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* Waiting for Others */}
+            {waitingDocs.length > 0 && (
+              <div>
+                <h2 className="text-lg font-semibold text-gray-900 mb-3">
+                  Waiting for Others ({waitingDocs.length})
+                </h2>
+                <div className="bg-white rounded-lg shadow-sm overflow-hidden">
+                  {waitingDocs.map((doc, i) => (
+                    <div
+                      key={doc.id}
+                      className={`p-4 flex items-center justify-between ${i > 0 ? 'border-t border-gray-100' : ''}`}
+                    >
+                      <div>
+                        <p className="text-sm font-medium text-gray-700">{doc.packet.name}</p>
+                        <p className="text-xs text-gray-400">Role: {doc.roleName}</p>
+                      </div>
+                      <span className="px-2 py-1 text-xs font-medium rounded-full bg-gray-100 text-gray-600">
+                        Waiting
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* Completed */}
+            {signedDocs.length > 0 && (
+              <div>
+                <h2 className="text-lg font-semibold text-gray-900 mb-3">
+                  Signed ({signedDocs.length})
+                </h2>
+                <div className="bg-white rounded-lg shadow-sm overflow-hidden">
+                  {signedDocs.map((doc, i) => (
+                    <div
+                      key={doc.id}
+                      className={`p-4 flex items-center justify-between ${i > 0 ? 'border-t border-gray-100' : ''}`}
+                    >
+                      <div>
+                        <p className="text-sm font-medium text-gray-700">{doc.packet.name}</p>
+                        <p className="text-xs text-gray-400">
+                          Signed {doc.signedAt ? new Date(doc.signedAt).toLocaleDateString() : ''}
+                        </p>
+                      </div>
+                      <span className="px-2 py-1 text-xs font-medium rounded-full bg-green-100 text-green-700">
+                        Signed
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </>
         )}
       </div>
     </>

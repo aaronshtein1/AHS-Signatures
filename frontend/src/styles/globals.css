@@ -42,14 +42,88 @@
   }
 }
 
-/* Signature pad canvas */
-.signature-canvas {
-  border: 2px dashed #d1d5db;
-  border-radius: 0.5rem;
-  background-color: white;
-  touch-action: none;
+/* Signature pad - draw mode */
+.signature-pad-wrapper {
+  position: relative;
+  border: 2px solid #e5e7eb;
+  border-radius: 0.75rem;
+  background: linear-gradient(180deg, #ffffff 0%, #fafbff 100%);
+  box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.04);
+  transition: border-color 0.2s, box-shadow 0.2s;
 }
 
-.signature-canvas:hover {
-  border-color: #9ca3af;
+.signature-pad-wrapper:hover {
+  border-color: #93c5fd;
+  box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.04), 0 0 0 3px rgba(59, 130, 246, 0.08);
+}
+
+.signature-line {
+  position: absolute;
+  bottom: 2.5rem;
+  left: 2rem;
+  right: 2rem;
+  border-bottom: 1.5px solid #d1d5db;
+  pointer-events: none;
+  z-index: 20;
+}
+
+.signature-x {
+  position: absolute;
+  left: -0.25rem;
+  bottom: -0.1rem;
+  font-size: 1.1rem;
+  color: #9ca3af;
+  font-weight: 300;
+  line-height: 1;
+}
+
+/* Signature pad - type mode preview */
+.signature-type-preview {
+  border: 2px solid #e5e7eb;
+  border-radius: 0.75rem;
+  padding: 1.5rem 2rem;
+  background: linear-gradient(180deg, #ffffff 0%, #fafbff 100%);
+  min-height: 7rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.04);
+}
+
+.signature-type-inner {
+  position: relative;
+  width: 100%;
+  padding-bottom: 0.5rem;
+}
+
+.signature-type-text {
+  text-align: center;
+  font-size: 2.5rem;
+  color: #0a0a50;
+  padding-bottom: 0.5rem;
+  line-height: 1.2;
+}
+
+.signature-type-line {
+  position: absolute;
+  bottom: 0;
+  left: 1rem;
+  right: 1rem;
+  border-bottom: 1.5px solid #d1d5db;
+}
+
+/* Print styles for signing confirmation */
+@media print {
+  body {
+    background: white !important;
+  }
+
+  .no-print {
+    display: none !important;
+  }
+
+  .print-confirmation {
+    border: none !important;
+    padding-top: 0 !important;
+  }
 }

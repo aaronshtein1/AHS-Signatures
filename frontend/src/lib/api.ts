@@ -34,8 +34,9 @@ export const auth = {
 
 // Packets API
 export const packets = {
-  list: (params?: { status?: string }) => {
-    const query = params ? `?${new URLSearchParams(params as Record<string, string>)}` : '';
+  list: (params?: { status?: string; county?: string; formRouteId?: string }) => {
+    const filtered = params ? Object.fromEntries(Object.entries(params).filter(([, v]) => v)) : {};
+    const query = Object.keys(filtered).length ? `?${new URLSearchParams(filtered as Record<string, string>)}` : '';
     return api<Packet[]>(`/api/packets${query}`);
   },
 
@@ -74,6 +75,20 @@ export const packets = {
   timeline: (id: string) => api<AuditLog[]>(`/api/packets/${id}/timeline`),
 
   getRoles: (id: string) => api<{ roles: string[]; placeholders: Placeholder[] }>(`/api/packets/${id}/roles`),
+
+  reassign: (packetId: string, recipientId: string, data: { name: string; email: string }) =>
+    api<{ success: boolean; message: string }>(`/api/packets/${packetId}/recipients/${recipientId}/reassign`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data),
+    }),
+
+  bulkAssign: (data: { packetIds: string[]; signerName: string; signerEmail: string; signerRole?: string }) =>
+    api<{ success: boolean; assigned: number; total: number; errors: string[] }>('/api/packets/bulk-assign', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data),
+    }),
 };
 
 // Signing API (public - uses token auth)
@@ -87,6 +102,8 @@ export const signing = {
       body: JSON.stringify(data),
     }),
 
+  getConfirmation: (token: string) => api<SigningConfirmation>(`/api/signing/${token}/confirmation`),
+
   getPdfUrl: (token: string) => `${API_URL}/api/signing/${token}/pdf`,
 };
 
@@ -94,7 +111,16 @@ export const signing = {
 export const admin = {
   stats: () => api<DashboardStats>('/api/admin/stats'),
 
+  analytics: (params?: { days?: number; formRouteId?: string; county?: string }) => {
+    const entries = params
+      ? Object.entries(params).filter(([, v]) => v !== undefined && v !== '').map(([k, v]) => [k, String(v)])
+      : [];
+    const query = entries.length ? `?${new URLSearchParams(entries)}` : '';
+    return api<AnalyticsResponse>(`/api/admin/analytics${query}`);
+  },
+
   downloadUrl: (packetId: string) => `${API_URL}/api/admin/packets/${packetId}/download`,
+  previewUrl: (packetId: string) => `${API_URL}/api/admin/packets/${packetId}/preview`,
 
   auditLogs: (params?: Record<string, string>) => {
     const query = params ? `?${new URLSearchParams(params)}` : '';
@@ -102,6 +128,88 @@ export const admin = {
   },
 
   users: () => api<User[]>('/api/admin/users'),
+
+  // Form Routes
+  formRoutes: {
+    list: () => api<FormRoute[]>('/api/admin/form-routes'),
+
+    get: (id: string) => api<FormRoute>(`/api/admin/form-routes/${id}`),
+
+    create: (data: CreateFormRouteData) =>
+      api<FormRoute>('/api/admin/form-routes', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(data),
+      }),
+
+    update: (id: string, data: Partial<CreateFormRouteData>) =>
+      api<FormRoute>(`/api/admin/form-routes/${id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(data),
+      }),
+
+    delete: (id: string) =>
+      api<{ success: boolean }>(`/api/admin/form-routes/${id}`, { method: 'DELETE' }),
+
+    pull: (id: string, days: number = 7) =>
+      api<PullResult>(`/api/admin/form-routes/${id}/pull?days=${days}`, { method: 'POST' }),
+  },
+
+  // SharePoint
+  sharepoint: {
+    status: () => api<{
+      configured: boolean;
+      connected?: boolean;
+      authenticated?: boolean;
+      driveFound?: boolean;
+      baseFolderAccessible?: boolean;
+      folderCount?: number;
+      error?: string;
+      message?: string;
+    }>('/api/admin/sharepoint/status'),
+
+    retry: (packetId: string) => api<{
+      success: boolean;
+      url: string;
+      folderName: string;
+      matchInfo: string;
+    }>(`/api/admin/sharepoint/retry/${packetId}`, { method: 'POST' }),
+
+    retryAll: () => api<{
+      success: boolean;
+      total: number;
+      succeeded: number;
+      failed: number;
+      errors: string[];
+    }>('/api/admin/sharepoint/retry-all', { method: 'POST' }),
+
+    failed: () => api<{
+      count: number;
+      packets: {
+        id: string;
+        name: string;
+        employeeName: string | null;
+        sharepointError: string | null;
+        completedAt: string | null;
+        formRouteId: string | null;
+      }[];
+    }>('/api/admin/sharepoint/failed'),
+
+    refreshCache: (subfolder?: string) =>
+      api<{ success: boolean; folderCount: number }>('/api/admin/sharepoint/refresh-cache', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ subfolder }),
+      }),
+  },
+
+  // Google Drive
+  google: {
+    status: () => api<{ connected: boolean; configured: boolean }>('/api/admin/google/status'),
+
+    authUrl: () => api<{ url: string }>('/api/admin/google/auth-url'),
+  },
 };
 
 // User Documents API (for regular users)
@@ -169,8 +277,15 @@ export interface Packet {
   fileName: string;
   filePath: string;
   placeholders: Placeholder[];
-  status: 'draft' | 'sent' | 'in_progress' | 'completed' | 'cancelled';
+  status: 'draft' | 'pending_assignment' | 'sent' | 'in_progress' | 'completed' | 'cancelled';
   signedPdfPath: string | null;
+  sharepointUrl?: string | null;
+  sharepointFolder?: string | null;
+  sharepointError?: string | null;
+  employeeName?: string | null;
+  employeeEmail?: string | null;
+  county?: string | null;
+  formRouteId?: string | null;
   createdAt: string;
   updatedAt: string;
   completedAt: string | null;
@@ -206,6 +321,7 @@ export interface AuditLog {
 export interface DashboardStats {
   packets: {
     draft: number;
+    pending_assignment: number;
     sent: number;
     in_progress: number;
     completed: number;
@@ -247,4 +363,105 @@ export interface SignatureSubmission {
   typedName: string;
   textFields?: Record<string, string>;
   confirmed: boolean;
+  attestationAcknowledged: boolean;
+  attestationText: string;
+}
+
+export interface SigningConfirmation {
+  confirmationId: string;
+  signer: {
+    name: string;
+    email: string;
+    role: string;
+  };
+  document: {
+    name: string;
+    fileName: string;
+  };
+  signature: {
+    type: string;
+    typedName: string;
+    signedAt: string;
+  };
+  attestation: {
+    text: string;
+    acknowledgedAt: string;
+  };
+  identity: {
+    ip: string;
+    userAgent: string;
+    signedAt: string;
+  };
+}
+
+export interface FormRoute {
+  id: string;
+  jotformFormId: string;
+  formName: string;
+  signerEmail: string | null;
+  signerName: string | null;
+  signerRole: string;
+  driveFolderId: string | null;
+  sharepointFolder: string | null;
+  isActive: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface PullResult {
+  success: boolean;
+  total: number;
+  created: number;
+  skipped: number;
+  errors: string[];
+}
+
+export interface CreateFormRouteData {
+  jotformFormId: string;
+  formName: string;
+  signerEmail?: string;
+  signerName?: string;
+  signerRole?: string;
+  driveFolderId?: string;
+  sharepointFolder?: string;
+  isActive?: boolean;
+}
+
+// Analytics types
+export interface AnalyticsResponse {
+  kpis: {
+    totalPackets: number;
+    needsAssignment: number;
+    inProgress: number;
+    completed: number;
+    avgCompletionHours: number | null;
+  };
+  statusDistribution: { status: string; count: number; label: string }[];
+  completionTrend: { date: string; created: number; completed: number }[];
+  byFormRoute: {
+    formRouteId: string | null;
+    formName: string;
+    draft: number;
+    pending_assignment: number;
+    sent: number;
+    in_progress: number;
+    completed: number;
+    cancelled: number;
+    total: number;
+  }[];
+  byCounty: { county: string; count: number; completed: number }[];
+  needsAttention: {
+    id: string;
+    name: string;
+    employeeName: string | null;
+    county: string | null;
+    formRouteId: string | null;
+    formName: string | null;
+    createdAt: string;
+  }[];
+  recentActivity: AuditLog[];
+  filterOptions: {
+    formRoutes: { id: string; formName: string }[];
+    counties: string[];
+  };
 }
