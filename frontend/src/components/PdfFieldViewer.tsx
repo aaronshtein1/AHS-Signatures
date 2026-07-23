@@ -60,21 +60,37 @@ export default function PdfFieldViewer({
   }, []);
 
   const onPageLoadSuccess = useCallback((page: any) => {
+    // react-pdf v10 PageCallback has originalWidth/originalHeight
+    // Fallback to view array [x1, y1, x2, y2] which gives the MediaBox
+    const w = page.originalWidth ?? page.width ?? (page.view ? page.view[2] - page.view[0] : 612);
+    const h = page.originalHeight ?? page.height ?? (page.view ? page.view[3] - page.view[1] : 792);
     setPageDims((prev) => ({
       ...prev,
-      [page.pageNumber]: { width: page.originalWidth, height: page.originalHeight },
+      [page.pageNumber]: { width: w, height: h },
     }));
   }, []);
 
-  // Compute overlay position for a placeholder
+  // Compute overlay position for a placeholder (PDF coords → screen coords)
   const getFieldStyle = (p: Placeholder, pageNum: number): React.CSSProperties => {
     const dims = pageDims[pageNum];
-    if (!dims) return { display: 'none' };
+    if (!dims || !dims.width || !dims.height) return { display: 'none' };
     const scale = containerWidth / dims.width;
+    const renderedH = dims.height * scale;
+
+    // PDF y-coordinate is from bottom; convert to top-based screen coordinate
+    let top = (dims.height - p.y) * scale - p.height * scale;
+    let left = p.x * scale;
+
+    // Clamp to keep within page bounds
+    if (top < 0) top = 0;
+    if (left < 0) left = 0;
+    if (top + p.height * scale > renderedH) top = renderedH - p.height * scale;
+
     return {
       position: 'absolute',
-      left: p.x * scale,
-      top: (dims.height - p.y) * scale - p.height * scale,
+      zIndex: 10,
+      left,
+      top,
       width: p.width * scale,
       height: p.height * scale,
     };
@@ -134,7 +150,7 @@ export default function PdfFieldViewer({
           return (
             <div
               key={pageNum}
-              className="relative mb-6 shadow-lg mx-auto bg-white"
+              className="relative mb-6 shadow-lg mx-auto bg-white overflow-hidden"
               style={{ width: containerWidth }}
             >
               <Page
@@ -207,7 +223,7 @@ export default function PdfFieldViewer({
                 })}
 
               {/* Page number */}
-              <div className="absolute bottom-2 right-3 text-xs text-gray-400 bg-white/80 px-1.5 py-0.5 rounded">
+              <div className="absolute bottom-2 right-3 text-xs text-gray-400 bg-white/80 px-1.5 py-0.5 rounded z-20">
                 Page {pageNum} of {numPages}
               </div>
             </div>
