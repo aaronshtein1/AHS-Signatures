@@ -1,65 +1,53 @@
-import { FastifyPluginAsync } from 'fastify';
-import { prisma } from '../utils/prisma.js';
+import { Hono } from 'hono';
+import { db, recipients, eq, and } from '../db/index.js';
 import { requireAuth } from '../middleware/auth.middleware.js';
 
-export const userRoutes: FastifyPluginAsync = async (fastify) => {
-  // Protect all user routes
-  fastify.addHook('preHandler', requireAuth);
+export const userRoutes = new Hono();
 
-  // GET /documents - user's assigned documents (matched by email)
-  fastify.get('/documents', async (request) => {
-    const currentUser = request.currentUser!;
+userRoutes.use('*', requireAuth);
 
-    // Find recipients that match the user's email
-    const recipients = await prisma.recipient.findMany({
-      where: { email: currentUser.email },
-      include: {
-        packet: {
-          select: {
-            id: true,
-            name: true,
-            fileName: true,
-            status: true,
-            createdAt: true,
-          },
-        },
+// GET /documents
+userRoutes.get('/documents', async (c) => {
+  const currentUser = c.get('currentUser');
+
+  const recs = await db.query.recipients.findMany({
+    where: eq(recipients.email, currentUser.email),
+    with: {
+      packet: {
+        columns: { id: true, name: true, fileName: true, status: true, createdAt: true },
       },
-      orderBy: { packet: { createdAt: 'desc' } },
-    });
-
-    return recipients.map((r) => ({
-      id: r.id,
-      roleName: r.roleName,
-      status: r.status,
-      signedAt: r.signedAt,
-      packet: r.packet,
-      canSign: r.status === 'notified' || r.status === 'pending',
-    }));
+    },
   });
 
-  // GET /documents/:id/sign-url - get signing URL for a document
-  fastify.get<{ Params: { id: string } }>(
-    '/documents/:id/sign-url',
-    async (request, reply) => {
-      const currentUser = request.currentUser!;
-      const { id } = request.params;
+  // Sort by packet.createdAt desc (Drizzle relational queries don't support ordering by relation fields)
+  recs.sort((a, b) => new Date(b.packet.createdAt).getTime() - new Date(a.packet.createdAt).getTime());
 
-      const recipient = await prisma.recipient.findFirst({
-        where: {
-          id,
-          email: currentUser.email,
-        },
-      });
+  return c.json(recs.map((r) => ({
+    id: r.id,
+    roleName: r.roleName,
+    status: r.status,
+    signedAt: r.signedAt,
+    packet: r.packet,
+    canSign: r.status === 'notified' || r.status === 'pending',
+  })));
+});
 
-      if (!recipient) {
-        return reply.status(404).send({ error: 'Document not found' });
-      }
+// GET /documents/:id/sign-url
+userRoutes.get('/documents/:id/sign-url', async (c) => {
+  const currentUser = c.get('currentUser');
+  const id = c.req.param('id');
 
-      if (recipient.status === 'signed') {
-        return reply.status(400).send({ error: 'Already signed' });
-      }
+  const recipient = await db.query.recipients.findFirst({
+    where: and(eq(recipients.id, id), eq(recipients.email, currentUser.email)),
+  });
 
-      return { signUrl: `/sign/${recipient.token}` };
-    }
-  );
-};
+  if (!recipient) {
+    return c.json({ error: 'Document not found' }, 404);
+  }
+
+  if (recipient.status === 'signed') {
+    return c.json({ error: 'Already signed' }, 400);
+  }
+
+  return c.json({ signUrl: `/sign/${recipient.token}` });
+});

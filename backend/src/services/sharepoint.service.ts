@@ -1,5 +1,5 @@
 import { config } from '../utils/config.js';
-import { prisma } from '../utils/prisma.js';
+import { db, sharePointFolderCaches, eq, and, gte } from '../db/index.js';
 
 // --- Types ---
 
@@ -26,7 +26,7 @@ export interface SharePointUploadResult {
   url: string;
   folderName: string;
   folderPath: string;
-  matchConfidence: number; // 0 = new folder created, >0 = matched existing folder
+  matchConfidence: number;
   isExistingFolder: boolean;
 }
 
@@ -40,7 +40,7 @@ class SharePointError extends Error {
 // --- Module-level caches ---
 
 const GRAPH_BASE_URL = 'https://graph.microsoft.com/v1.0';
-const FOLDER_CACHE_TTL_MS = 60 * 60 * 1000; // 1 hour (DB cache can be longer than in-memory)
+const FOLDER_CACHE_TTL_MS = 60 * 60 * 1000;
 
 let cachedToken: TokenCache | null = null;
 let cachedSiteId: string | null = null;
@@ -55,7 +55,6 @@ function sleep(ms: number): Promise<void> {
 // --- Authentication ---
 
 async function getAccessToken(): Promise<string> {
-  // Return cached token if still valid (5-minute buffer)
   if (cachedToken && Date.now() < cachedToken.expiresAt - 5 * 60 * 1000) {
     return cachedToken.token;
   }
@@ -90,7 +89,7 @@ async function getAccessToken(): Promise<string> {
   return data.access_token;
 }
 
-// --- Robust HTTP Request Wrapper (ported from AHS-Compliance _make_request) ---
+// --- Robust HTTP Request Wrapper ---
 
 async function graphRequest(
   method: string,
@@ -159,7 +158,7 @@ async function graphRequest(
   throw new SharePointError('Request failed after retries');
 }
 
-// --- Site and Drive Discovery (ported from AHS-Compliance _get_site_id / _get_drive_id) ---
+// --- Site and Drive Discovery ---
 
 async function resolveSiteId(): Promise<string> {
   if (cachedSiteId) return cachedSiteId;
@@ -195,7 +194,6 @@ async function resolveDriveId(): Promise<string> {
   const data: any = await response.json();
   const drives = data.value || [];
 
-  // Exact match (case-insensitive)
   for (const drive of drives) {
     if ((drive.name || '').toLowerCase() === libraryName.toLowerCase()) {
       cachedDriveId = drive.id;
@@ -204,7 +202,6 @@ async function resolveDriveId(): Promise<string> {
     }
   }
 
-  // Partial match fallback
   for (const drive of drives) {
     if ((drive.name || '').toLowerCase().includes(libraryName.toLowerCase())) {
       cachedDriveId = drive.id;
@@ -219,7 +216,7 @@ async function resolveDriveId(): Promise<string> {
   );
 }
 
-// --- Folder Navigation (ported from AHS-Compliance list_employee_folders / _list_folders_at_url) ---
+// --- Folder Navigation ---
 
 async function listFoldersFromApi(folderPath: string): Promise<SharePointFolder[]> {
   const driveId = await resolveDriveId();
@@ -246,23 +243,22 @@ async function listFoldersFromApi(folderPath: string): Promise<SharePointFolder[
       }
     }
 
-    // Handle pagination
     url = data['@odata.nextLink'] || null;
   }
 
   return folders;
 }
 
-// --- DB Folder Cache (ported from AHS-Compliance sharepoint_folder_cache table) ---
+// --- DB Folder Cache ---
 
 async function getCachedFolders(cacheKey: string): Promise<SharePointFolder[] | null> {
   const cutoff = new Date(Date.now() - FOLDER_CACHE_TTL_MS);
 
-  const rows = await prisma.sharePointFolderCache.findMany({
-    where: {
-      cacheKey,
-      cachedAt: { gte: cutoff },
-    },
+  const rows = await db.query.sharePointFolderCaches.findMany({
+    where: and(
+      eq(sharePointFolderCaches.cacheKey, cacheKey),
+      gte(sharePointFolderCaches.cachedAt, cutoff)
+    ),
   });
 
   if (rows.length === 0) return null;
@@ -278,31 +274,25 @@ async function getCachedFolders(cacheKey: string): Promise<SharePointFolder[] | 
 }
 
 async function setCachedFolders(cacheKey: string, folders: SharePointFolder[]): Promise<void> {
-  // Clear old entries for this cache key
-  await prisma.sharePointFolderCache.deleteMany({
-    where: { cacheKey },
-  });
+  await db.delete(sharePointFolderCaches)
+    .where(eq(sharePointFolderCaches.cacheKey, cacheKey));
 
   if (folders.length === 0) return;
 
-  // Insert new entries
-  await prisma.sharePointFolderCache.createMany({
-    data: folders.map(f => ({
-      folderId: f.id,
-      name: f.name,
-      webUrl: f.webUrl,
-      childCount: f.childCount,
-      path: f.path,
-      parentFolder: f.parentFolder,
-      cacheKey,
-    })),
-  });
+  await db.insert(sharePointFolderCaches).values(folders.map(f => ({
+    folderId: f.id,
+    name: f.name,
+    webUrl: f.webUrl,
+    childCount: f.childCount,
+    path: f.path,
+    parentFolder: f.parentFolder,
+    cacheKey,
+  })));
 }
 
 async function invalidateFolderCache(cacheKey: string): Promise<void> {
-  await prisma.sharePointFolderCache.deleteMany({
-    where: { cacheKey },
-  });
+  await db.delete(sharePointFolderCaches)
+    .where(eq(sharePointFolderCaches.cacheKey, cacheKey));
 }
 
 async function getEmployeeFolders(subfolder?: string | null): Promise<SharePointFolder[]> {
@@ -313,31 +303,27 @@ async function getEmployeeFolders(subfolder?: string | null): Promise<SharePoint
 
   const cacheKey = searchPath;
 
-  // Check DB cache first
   const cached = await getCachedFolders(cacheKey);
   if (cached) {
     console.log(`[SharePoint] Using cached folder list for "${cacheKey}" (${cached.length} folders)`);
     return cached;
   }
 
-  // Fetch from SharePoint API
   try {
     console.log(`[SharePoint] Fetching folder list from API for "${cacheKey}"...`);
     const folders = await listFoldersFromApi(searchPath);
     console.log(`[SharePoint] Found ${folders.length} folders, caching to DB`);
 
-    // Store in DB cache
     await setCachedFolders(cacheKey, folders);
 
     return folders;
   } catch (err) {
-    // If the folder doesn't exist yet, return empty (it will be created on upload)
     console.warn(`[SharePoint] Could not list folders at "${searchPath}": ${err}`);
     return [];
   }
 }
 
-// --- Fuzzy Name Matching (ported from AHS-Compliance employee_folder_finder.py) ---
+// --- Fuzzy Name Matching ---
 
 function normalizeName(name: string): string {
   return name
@@ -347,10 +333,6 @@ function normalizeName(name: string): string {
     .replace(/[^\w\s-]/g, '');
 }
 
-/**
- * Ratcliff/Obershelp similarity algorithm.
- * Produces the same result as Python's difflib.SequenceMatcher.ratio().
- */
 function sequenceMatchRatio(a: string, b: string): number {
   if (a.length === 0 && b.length === 0) return 1.0;
   if (a.length === 0 || b.length === 0) return 0.0;
@@ -383,12 +365,10 @@ function sequenceMatchRatio(a: string, b: string): number {
 
     let matches = bestLen;
 
-    // Recurse left
     if (bestAStart > aStart && bestBStart > bStart) {
       matches += countMatches(aStart, bestAStart, bStart, bestBStart);
     }
 
-    // Recurse right
     const aRight = bestAStart + bestLen;
     const bRight = bestBStart + bestLen;
     if (aRight < aEnd && bRight < bEnd) {
@@ -418,7 +398,6 @@ function findBestFolderMatch(
     const folderNormalized = normalizeName(folder.name);
     if (!folderNormalized) continue;
 
-    // Fast exact match check
     if (normalized === folderNormalized) {
       return { folder, confidence: 1.0 };
     }
@@ -432,13 +411,8 @@ function findBestFolderMatch(
   return bestMatch;
 }
 
-// --- Upload (enhanced with fuzzy matching and retries) ---
+// --- Upload ---
 
-/**
- * Upload a file to SharePoint via Microsoft Graph API.
- * Searches for existing employee folders using fuzzy name matching.
- * Creates employee folder automatically if no match found.
- */
 export async function uploadToSharePoint(
   employeeName: string,
   fileName: string,
@@ -447,16 +421,13 @@ export async function uploadToSharePoint(
 ): Promise<SharePointUploadResult> {
   const driveId = await resolveDriveId();
 
-  // Sanitize file name
   const safeFileName = fileName.replace(/[<>:"/\\|?*]/g, '_').trim();
 
-  // Build base path
   let basePath = config.SHAREPOINT_BASE_FOLDER;
   if (subfolder) {
     basePath += `/${subfolder}`;
   }
 
-  // Try to find existing employee folder via fuzzy matching
   let resolvedFolderName: string;
   let matchConfidence = 0;
   let isExistingFolder = false;
@@ -472,7 +443,6 @@ export async function uploadToSharePoint(
       `[SharePoint] Matched "${employeeName}" to existing folder "${match.folder.name}" (${Math.round(match.confidence * 100)}% confidence)`
     );
   } else {
-    // No match — fall back to sanitized name (creates new folder)
     resolvedFolderName = employeeName.replace(/[<>:"/\\|?*]/g, '_').trim();
     console.log(
       `[SharePoint] No existing folder match for "${employeeName}", creating new folder "${resolvedFolderName}"`
@@ -482,7 +452,6 @@ export async function uploadToSharePoint(
   const folderPath = `${basePath}/${resolvedFolderName}`;
   const uploadPath = `${folderPath}/${safeFileName}`;
 
-  // Graph API upload (auto-creates intermediate folders)
   const uploadUrl = `/drives/${driveId}/root:/${encodeURIComponent(uploadPath)}:/content`;
 
   const response = await graphRequest('PUT', uploadUrl, {
@@ -492,7 +461,6 @@ export async function uploadToSharePoint(
 
   const result: any = await response.json();
 
-  // Invalidate DB folder cache since we may have created a new folder
   if (!isExistingFolder) {
     await invalidateFolderCache(basePath);
   }
@@ -511,10 +479,6 @@ export async function uploadToSharePoint(
 
 // --- Configuration Check ---
 
-/**
- * Check if SharePoint integration is properly configured.
- * Supports both direct DRIVE_ID and SITE_URL + LIBRARY_NAME approaches.
- */
 export function isSharePointConfigured(): boolean {
   if (!config.SHAREPOINT_ENABLED) return false;
   if (!config.MICROSOFT_CLIENT_ID || !config.MICROSOFT_CLIENT_SECRET || !config.MICROSOFT_TENANT_ID) {
@@ -525,11 +489,8 @@ export function isSharePointConfigured(): boolean {
   return false;
 }
 
-// --- Connection Test (for admin debugging) ---
+// --- Connection Test ---
 
-/**
- * Test the SharePoint connection and return diagnostic info.
- */
 export async function testSharePointConnection(): Promise<{
   authenticated: boolean;
   driveFound: boolean;
@@ -567,10 +528,6 @@ export async function testSharePointConnection(): Promise<{
   return info;
 }
 
-/**
- * Force refresh the folder cache for a given path.
- * Useful when admin knows folders have changed on SharePoint.
- */
 export async function refreshFolderCache(subfolder?: string | null): Promise<number> {
   let searchPath = config.SHAREPOINT_BASE_FOLDER;
   if (subfolder) {

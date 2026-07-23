@@ -20,6 +20,7 @@ export default function Layout({ children }: LayoutProps) {
   const adminNavItems = [
     { href: '/', label: 'Dashboard' },
     { href: '/packets', label: 'Packets' },
+    { href: '/users', label: 'Users' },
     { href: '/my-documents', label: 'My Documents' },
     { href: '/form-routes', label: 'Form Routes' },
   ];

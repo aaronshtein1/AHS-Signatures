@@ -1,5 +1,5 @@
-import bcrypt from 'bcrypt';
-import { prisma } from '../utils/prisma.js';
+import bcrypt from 'bcryptjs';
+import { db, users, eq } from '../db/index.js';
 
 const SALT_ROUNDS = 10;
 
@@ -13,15 +13,15 @@ export const authService = {
   },
 
   async findUserByEmail(email: string) {
-    return prisma.user.findUnique({
-      where: { email: email.toLowerCase() },
-    });
+    return db.query.users.findFirst({
+      where: eq(users.email, email.toLowerCase()),
+    }) ?? null;
   },
 
   async findUserById(id: string) {
-    return prisma.user.findUnique({
-      where: { id },
-      select: {
+    return db.query.users.findFirst({
+      where: eq(users.id, id),
+      columns: {
         id: true,
         email: true,
         name: true,
@@ -30,14 +30,15 @@ export const authService = {
         createdAt: true,
         lastLoginAt: true,
       },
-    });
+    }) ?? null;
   },
 
   async updateLastLogin(userId: string) {
-    return prisma.user.update({
-      where: { id: userId },
-      data: { lastLoginAt: new Date() },
-    });
+    const [updated] = await db.update(users)
+      .set({ lastLoginAt: new Date() })
+      .where(eq(users.id, userId))
+      .returning();
+    return updated;
   },
 
   async createUser(data: {
@@ -47,21 +48,19 @@ export const authService = {
     role?: 'admin' | 'user';
   }) {
     const passwordHash = await this.hashPassword(data.password);
-    return prisma.user.create({
-      data: {
-        email: data.email.toLowerCase(),
-        passwordHash,
-        name: data.name,
-        role: data.role || 'user',
-      },
-      select: {
-        id: true,
-        email: true,
-        name: true,
-        role: true,
-        isActive: true,
-        createdAt: true,
-      },
+    const [user] = await db.insert(users).values({
+      email: data.email.toLowerCase(),
+      passwordHash,
+      name: data.name,
+      role: data.role || 'user',
+    }).returning({
+      id: users.id,
+      email: users.email,
+      name: users.name,
+      role: users.role,
+      isActive: users.isActive,
+      createdAt: users.createdAt,
     });
+    return user;
   },
 };

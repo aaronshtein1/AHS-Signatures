@@ -1,65 +1,92 @@
-import { FastifyRequest, FastifyReply } from 'fastify';
+import { Context, Next } from 'hono';
+import { getCookie } from 'hono/cookie';
+import { jwtVerify } from 'jose';
 import { authService } from '../services/auth.service.js';
+import { config } from '../utils/config.js';
 
-// Extend FastifyRequest with our user type
-declare module 'fastify' {
-  interface FastifyRequest {
-    currentUser?: {
-      id: string;
-      email: string;
-      name: string;
-      role: string;
-      isActive: boolean;
-    };
+export interface CurrentUser {
+  id: string;
+  email: string;
+  name: string;
+  role: string;
+  isActive: boolean;
+}
+
+// Hono context variable types
+declare module 'hono' {
+  interface ContextVariableMap {
+    currentUser: CurrentUser;
   }
 }
 
-declare module '@fastify/jwt' {
-  interface FastifyJWT {
-    payload: { userId: string };
-    user: { userId: string };
-  }
-}
+const getJwtSecret = () => new TextEncoder().encode(config.JWT_SECRET);
 
-export async function requireAuth(
-  request: FastifyRequest,
-  reply: FastifyReply
-): Promise<void> {
+export async function requireAuth(c: Context, next: Next): Promise<Response | void> {
+  const token = getCookie(c, 'token');
+  if (!token) {
+    return c.json({ error: 'Invalid or expired token' }, 401);
+  }
+
   try {
-    await request.jwtVerify();
+    const { payload } = await jwtVerify(token, getJwtSecret());
+    const userId = (payload as any).userId as string;
 
-    const { userId } = request.user as { userId: string };
     const user = await authService.findUserById(userId);
-
     if (!user) {
-      return reply.status(401).send({ error: 'User not found' });
+      return c.json({ error: 'User not found' }, 401);
     }
 
     if (!user.isActive) {
-      return reply.status(403).send({ error: 'Account is disabled' });
+      return c.json({ error: 'Account is disabled' }, 403);
     }
 
-    request.currentUser = {
+    c.set('currentUser', {
       id: user.id,
       email: user.email,
       name: user.name,
       role: user.role,
       isActive: user.isActive,
-    };
-  } catch (err) {
-    return reply.status(401).send({ error: 'Invalid or expired token' });
+    });
+
+    await next();
+  } catch {
+    return c.json({ error: 'Invalid or expired token' }, 401);
   }
 }
 
-export async function requireAdmin(
-  request: FastifyRequest,
-  reply: FastifyReply
-): Promise<void> {
-  await requireAuth(request, reply);
+export async function requireAdmin(c: Context, next: Next): Promise<Response | void> {
+  const token = getCookie(c, 'token');
+  if (!token) {
+    return c.json({ error: 'Invalid or expired token' }, 401);
+  }
 
-  if (reply.sent) return;
+  try {
+    const { payload } = await jwtVerify(token, getJwtSecret());
+    const userId = (payload as any).userId as string;
 
-  if (request.currentUser?.role !== 'admin') {
-    return reply.status(403).send({ error: 'Admin access required' });
+    const user = await authService.findUserById(userId);
+    if (!user) {
+      return c.json({ error: 'User not found' }, 401);
+    }
+
+    if (!user.isActive) {
+      return c.json({ error: 'Account is disabled' }, 403);
+    }
+
+    if (user.role !== 'admin') {
+      return c.json({ error: 'Admin access required' }, 403);
+    }
+
+    c.set('currentUser', {
+      id: user.id,
+      email: user.email,
+      name: user.name,
+      role: user.role,
+      isActive: user.isActive,
+    });
+
+    await next();
+  } catch {
+    return c.json({ error: 'Invalid or expired token' }, 401);
   }
 }

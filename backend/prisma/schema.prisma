@@ -1,9 +1,10 @@
 generator client {
-  provider = "prisma-client-js"
+  provider        = "prisma-client-js"
+  previewFeatures = ["driverAdapters"]
 }
 
 datasource db {
-  provider = "sqlite"
+  provider = "postgresql"
   url      = env("DATABASE_URL")
 }
 
@@ -31,6 +32,7 @@ model SigningPacket {
   placeholders    String   // JSON string of detected placeholders
   status          String   @default("draft") // draft, pending_assignment, sent, in_progress, completed, cancelled
   signedPdfPath   String?  // Path to final signed PDF
+  signedPdfHash   String?  // SHA-256 hash for tamper detection (M-274 I-9 compliance)
   sharepointUrl   String?  // SharePoint URL where signed PDF was uploaded
   sharepointFolder String? // SharePoint folder name the document was placed into
   sharepointError String?  // Error message if SharePoint upload failed

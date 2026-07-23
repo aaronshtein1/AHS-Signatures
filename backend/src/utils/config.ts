@@ -5,6 +5,7 @@ export const config = {
   PORT: parseInt(process.env.PORT || '3001', 10),
   DATABASE_URL: process.env.DATABASE_URL || 'postgresql://postgres:postgres@localhost:5432/ahs_signatures',
   CORS_ORIGIN: process.env.CORS_ORIGIN || 'http://localhost:3000',
+  API_BASE_URL: process.env.API_BASE_URL || '',
 
   // JWT Authentication
   JWT_SECRET: process.env.JWT_SECRET || 'change-this-secret-in-production',

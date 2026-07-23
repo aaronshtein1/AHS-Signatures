@@ -2,6 +2,17 @@ import { useState, useEffect } from 'react';
 import { useRouter } from 'next/router';
 import Head from 'next/head';
 import { useAuth } from '@/contexts/AuthContext';
+import { API_URL } from '@/lib/api';
+
+const SSO_ERROR_MESSAGES: Record<string, string> = {
+  microsoft_denied: 'Microsoft login was cancelled or denied.',
+  no_code: 'No authorization code received from Microsoft.',
+  microsoft_token_failed: 'Failed to authenticate with Microsoft. Please try again.',
+  no_email: 'Could not retrieve your email from Microsoft.',
+  invalid_domain: 'Only @homecare4all.org accounts can sign in with Microsoft.',
+  account_disabled: 'Your account has been disabled. Contact an administrator.',
+  microsoft_auth_failed: 'Microsoft authentication failed. Please try again.',
+};
 
 export default function LoginPage() {
   const [email, setEmail] = useState('');
@@ -12,6 +23,15 @@ export default function LoginPage() {
   const router = useRouter();
 
   const returnUrl = (router.query.returnUrl as string) || '/';
+
+  useEffect(() => {
+    // Show SSO error from redirect query params
+    const ssoError = router.query.error as string;
+    if (ssoError && SSO_ERROR_MESSAGES[ssoError]) {
+      const detail = router.query.detail as string;
+      setError(SSO_ERROR_MESSAGES[ssoError] + (detail ? ` (${detail})` : ''));
+    }
+  }, [router.query.error, router.query.detail]);
 
   useEffect(() => {
     // If already logged in, redirect based on role
@@ -31,7 +51,6 @@ export default function LoginPage() {
 
     try {
       await login(email, password);
-      // Redirect happens via useEffect after user state updates
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Login failed');
     } finally {
@@ -39,15 +58,7 @@ export default function LoginPage() {
     }
   };
 
-  const fillDemoCredentials = (role: 'admin' | 'user') => {
-    if (role === 'admin') {
-      setEmail('admin@example.com');
-      setPassword('admin123');
-    } else {
-      setEmail('user@example.com');
-      setPassword('user123');
-    }
-  };
+  const microsoftLoginUrl = `${API_URL}/api/auth/microsoft`;
 
   // Show loading while checking auth
   if (authLoading) {
@@ -76,36 +87,37 @@ export default function LoginPage() {
             </h2>
           </div>
 
-          {/* Demo Credentials */}
-          <div className="bg-blue-50 border border-blue-200 rounded-lg p-4">
-            <h3 className="text-sm font-medium text-blue-800 mb-2">Demo Credentials</h3>
-            <div className="space-y-2">
-              <button
-                type="button"
-                onClick={() => fillDemoCredentials('admin')}
-                className="w-full text-left px-3 py-2 bg-white rounded border border-blue-200 hover:bg-blue-50 transition-colors"
-              >
-                <span className="font-medium text-blue-700">Admin:</span>{' '}
-                <span className="text-gray-600">admin@example.com / admin123</span>
-              </button>
-              <button
-                type="button"
-                onClick={() => fillDemoCredentials('user')}
-                className="w-full text-left px-3 py-2 bg-white rounded border border-blue-200 hover:bg-blue-50 transition-colors"
-              >
-                <span className="font-medium text-blue-700">User:</span>{' '}
-                <span className="text-gray-600">user@example.com / user123</span>
-              </button>
+          {error && (
+            <div className="bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded">
+              {error}
+            </div>
+          )}
+
+          {/* Microsoft SSO Link */}
+          <a
+            href={microsoftLoginUrl}
+            className="w-full flex items-center justify-center gap-3 px-4 py-3 border border-gray-300 rounded-md shadow-sm bg-white text-gray-700 font-medium hover:bg-gray-50 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500 transition-colors"
+          >
+            <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 23 23">
+              <rect x="1" y="1" width="10" height="10" fill="#f25022" />
+              <rect x="12" y="1" width="10" height="10" fill="#7fba00" />
+              <rect x="1" y="12" width="10" height="10" fill="#00a4ef" />
+              <rect x="12" y="12" width="10" height="10" fill="#ffb900" />
+            </svg>
+            Sign in with Microsoft
+          </a>
+
+          {/* Divider */}
+          <div className="relative">
+            <div className="absolute inset-0 flex items-center">
+              <div className="w-full border-t border-gray-300" />
+            </div>
+            <div className="relative flex justify-center text-sm">
+              <span className="px-2 bg-gray-50 text-gray-500">or sign in with email</span>
             </div>
           </div>
 
-          <form className="mt-8 space-y-6" onSubmit={handleSubmit}>
-            {error && (
-              <div className="bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded">
-                {error}
-              </div>
-            )}
-
+          <form className="space-y-6" onSubmit={handleSubmit}>
             <div className="rounded-md shadow-sm -space-y-px">
               <div>
                 <label htmlFor="email" className="sr-only">

@@ -1,13 +1,14 @@
 import { google } from 'googleapis';
 import { config } from '../utils/config.js';
-import { prisma } from '../utils/prisma.js';
+import { db, systemSettings, eq } from '../db/index.js';
 
 const SCOPES = ['https://www.googleapis.com/auth/drive.readonly'];
 const REDIRECT_PATH = '/api/admin/google/callback';
 
 function getRedirectUri(): string {
-  const base = config.FRONTEND_URL.replace(':3000', `:${config.PORT}`);
-  // Use the backend URL for OAuth callback
+  if (config.API_BASE_URL) {
+    return `${config.API_BASE_URL}${REDIRECT_PATH}`;
+  }
   return `http://localhost:${config.PORT}${REDIRECT_PATH}`;
 }
 
@@ -27,7 +28,7 @@ export function getAuthUrl(): string {
   const client = createOAuth2Client();
   return client.generateAuthUrl({
     access_type: 'offline',
-    prompt: 'consent', // Force consent to always get refresh token
+    prompt: 'consent',
     scope: SCOPES,
   });
 }
@@ -40,25 +41,22 @@ export async function handleCallback(code: string): Promise<void> {
     throw new Error('No refresh token received. Try revoking access at https://myaccount.google.com/permissions and re-authorizing.');
   }
 
-  // Store refresh token in database
-  await prisma.systemSetting.upsert({
-    where: { key: 'google_refresh_token' },
-    update: { value: tokens.refresh_token },
-    create: { key: 'google_refresh_token', value: tokens.refresh_token },
-  });
+  await db.insert(systemSettings)
+    .values({ key: 'google_refresh_token', value: tokens.refresh_token })
+    .onConflictDoUpdate({ target: systemSettings.key, set: { value: tokens.refresh_token } });
 }
 
 export async function isConnected(): Promise<boolean> {
   if (!isGoogleDriveConfigured()) return false;
-  const setting = await prisma.systemSetting.findUnique({
-    where: { key: 'google_refresh_token' },
+  const setting = await db.query.systemSettings.findFirst({
+    where: eq(systemSettings.key, 'google_refresh_token'),
   });
   return !!setting?.value;
 }
 
 async function getAuthenticatedClient() {
-  const setting = await prisma.systemSetting.findUnique({
-    where: { key: 'google_refresh_token' },
+  const setting = await db.query.systemSettings.findFirst({
+    where: eq(systemSettings.key, 'google_refresh_token'),
   });
 
   if (!setting?.value) {
@@ -105,6 +103,23 @@ export async function listFiles(folderId: string, since?: Date): Promise<DriveFi
   } while (pageToken);
 
   return allFiles;
+}
+
+export async function listFolders(parentId?: string): Promise<DriveFile[]> {
+  const auth = await getAuthenticatedClient();
+  const drive = google.drive({ version: 'v3', auth });
+
+  const parent = parentId || 'root';
+  const query = `'${parent}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false`;
+
+  const response = await drive.files.list({
+    q: query,
+    fields: 'files(id, name, mimeType, modifiedTime)',
+    orderBy: 'name',
+    pageSize: 100,
+  });
+
+  return (response.data.files || []) as DriveFile[];
 }
 
 export async function downloadFile(fileId: string): Promise<Buffer> {

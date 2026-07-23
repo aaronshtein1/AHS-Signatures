@@ -4,17 +4,35 @@ import Head from 'next/head';
 import dynamic from 'next/dynamic';
 import SignaturePad from '@/components/SignaturePad';
 import StatusBadge from '@/components/StatusBadge';
+import ErrorBoundary from '@/components/ErrorBoundary';
 import { signing, SigningSession, SigningConfirmation, Placeholder } from '@/lib/api';
 
 // Client-only PDF viewer (react-pdf needs browser APIs)
-const PdfFieldViewer = dynamic(() => import('@/components/PdfFieldViewer'), {
-  ssr: false,
-  loading: () => (
-    <div className="flex items-center justify-center py-20">
-      <div className="animate-spin rounded-full h-10 w-10 border-b-2 border-blue-600" />
-    </div>
-  ),
-});
+const PdfFieldViewer = dynamic(
+  () => import('@/components/PdfFieldViewer').catch((err) => {
+    console.error('Failed to load PdfFieldViewer:', err);
+    // Return a fallback component so the page doesn't crash
+    return {
+      default: () => (
+        <div className="text-center py-20">
+          <p className="text-red-600 font-medium">Failed to load PDF viewer</p>
+          <p className="text-sm text-gray-500 mt-1">{err?.message || 'Unknown error'}</p>
+          <button onClick={() => window.location.reload()} className="mt-3 text-sm text-blue-600 underline">
+            Reload
+          </button>
+        </div>
+      ),
+    };
+  }),
+  {
+    ssr: false,
+    loading: () => (
+      <div className="flex items-center justify-center py-20">
+        <div className="animate-spin rounded-full h-10 w-10 border-b-2 border-blue-600" />
+      </div>
+    ),
+  },
+);
 
 const ATTESTATION_TEXT = `ELECTRONIC SIGNATURE DISCLOSURE AND CONSENT
 
@@ -63,8 +81,8 @@ export default function SigningPage() {
   // Signature modal
   const [sigModalOpen, setSigModalOpen] = useState(false);
 
-  // PDF data
-  const [pdfData, setPdfData] = useState<ArrayBuffer | null>(null);
+  // PDF as a Blob URL — immune to ArrayBuffer detachment by react-pdf worker
+  const [pdfUrl, setPdfUrl] = useState<string | null>(null);
 
   // Confirmation receipt
   const [confirmation, setConfirmation] = useState<SigningConfirmation | null>(null);
@@ -90,10 +108,11 @@ export default function SigningPage() {
       setTypedName(data.recipient.name);
 
       const initial: Record<string, string> = {};
-      data.placeholders.filter((p: Placeholder) => p.type === 'TEXT').forEach((p: Placeholder) => {
+      const placeholders = data.placeholders || [];
+      placeholders.filter((p: Placeholder) => p.type === 'TEXT').forEach((p: Placeholder) => {
         if (p.fieldName) initial[p.fieldName] = '';
       });
-      data.placeholders.filter((p: Placeholder) => p.type === 'DATE').forEach((p: Placeholder, idx: number) => {
+      placeholders.filter((p: Placeholder) => p.type === 'DATE').forEach((p: Placeholder, idx: number) => {
         const key = p.fieldName || `date_${idx}`;
         initial[key] = new Date().toLocaleDateString('en-US');
       });
@@ -111,12 +130,21 @@ export default function SigningPage() {
       const response = await fetch(url, { credentials: 'include' });
       if (!response.ok) throw new Error(`Failed to fetch PDF (${response.status})`);
       const data = await response.arrayBuffer();
-      setPdfData(data);
+      // Create a Blob URL — react-pdf reads from it without ArrayBuffer transfer/detachment
+      const blob = new Blob([data], { type: 'application/pdf' });
+      setPdfUrl(URL.createObjectURL(blob));
     } catch (err) {
       console.error('PDF load error:', err);
       setError(err instanceof Error ? err.message : 'Failed to load PDF');
     }
   };
+
+  // Revoke the Blob URL on unmount to free memory
+  useEffect(() => {
+    return () => {
+      if (pdfUrl) URL.revokeObjectURL(pdfUrl);
+    };
+  }, [pdfUrl]);
 
   const handleSignatureChange = (data: string | null, type: 'drawn' | 'typed') => {
     setSignatureData(data);
@@ -343,7 +371,7 @@ export default function SigningPage() {
             </div>
             <div className="flex items-center gap-3 flex-shrink-0 ml-4">
               <div className="hidden sm:flex items-center gap-1">
-                {session.signers.map((signer) => (
+                {(session.signers || []).map((signer) => (
                   <div
                     key={signer.order}
                     title={`${signer.name} - ${signer.status}`}
@@ -367,17 +395,29 @@ export default function SigningPage() {
         {/* Scrollable PDF with overlaid fields */}
         <div className="flex-1 overflow-y-auto px-4 py-6" style={{ paddingBottom: 90 }}>
           <div className="mx-auto" style={{ maxWidth: 900 }}>
-            <PdfFieldViewer
-              pdfData={pdfData}
-              placeholders={session.placeholders}
-              signatureData={signatureData}
-              textFields={textFields}
-              onTextFieldChange={handleTextFieldChange}
-              onSignatureClick={() => {
-                setSigningStep(attestationAcknowledged ? 1 : 0);
-                setSigModalOpen(true);
-              }}
-            />
+            <ErrorBoundary
+              fallback={
+                <div className="text-center py-20">
+                  <p className="text-red-600 font-medium">Failed to render PDF</p>
+                  <p className="text-sm text-gray-500 mt-1">Please refresh the page to try again.</p>
+                  <button onClick={() => window.location.reload()} className="mt-3 btn btn-secondary px-4 py-2 text-sm">
+                    Refresh
+                  </button>
+                </div>
+              }
+            >
+              <PdfFieldViewer
+                pdfUrl={pdfUrl}
+                placeholders={session.placeholders || []}
+                signatureData={signatureData}
+                textFields={textFields}
+                onTextFieldChange={handleTextFieldChange}
+                onSignatureClick={() => {
+                  setSigningStep(attestationAcknowledged ? 1 : 0);
+                  setSigModalOpen(true);
+                }}
+              />
+            </ErrorBoundary>
           </div>
         </div>
 

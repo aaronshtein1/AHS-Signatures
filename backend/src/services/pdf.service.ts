@@ -3,6 +3,35 @@ import fs from 'fs/promises';
 import path from 'path';
 import zlib from 'zlib';
 
+/**
+ * Decode a PDF hex string (e.g. "48656C6C6F") to its text content ("Hello").
+ */
+function decodeHexString(hex: string): string {
+  const cleanHex = hex.replace(/\s/g, '');
+  let text = '';
+  for (let i = 0; i < cleanHex.length; i += 2) {
+    text += String.fromCharCode(parseInt(cleanHex.substring(i, i + 2), 16));
+  }
+  return text;
+}
+
+/**
+ * Normalize PDF content stream by converting hex strings <AABB> to literal strings (text).
+ * pdf-lib and some PDF producers encode text as hex strings, but our regex patterns
+ * expect literal string format (text)Tj. This converts them so both formats are handled.
+ */
+function normalizeHexStringsInStream(streamContent: string): string {
+  return streamContent.replace(/<([0-9A-Fa-f]{2}(?:\s*[0-9A-Fa-f]{2})*)>/g, (_match, hex) => {
+    const decoded = decodeHexString(hex);
+    // Escape special characters for PDF literal string format
+    const escaped = decoded
+      .replace(/\\/g, '\\\\')
+      .replace(/\(/g, '\\(')
+      .replace(/\)/g, '\\)');
+    return '(' + escaped + ')';
+  });
+}
+
 export interface Placeholder {
   type: 'SIGNATURE' | 'DATE' | 'TEXT';
   role: string;
@@ -29,6 +58,10 @@ interface TagLocation {
  */
 function extractTagPositionsFromStream(streamContent: string, tagPatterns: RegExp[]): Array<{text: string, x: number, y: number}> {
   const results: Array<{text: string, x: number, y: number}> = [];
+
+  // Normalize hex-encoded strings <AABB> to literal strings (text)
+  // so regex patterns designed for (text)Tj also match hex-encoded text
+  streamContent = normalizeHexStringsInStream(streamContent);
 
   // Method 1: Find all (text)Tj patterns and look for preceding Tm
   const textShowRegex = /\(([^)\\]*(?:\\.[^)\\]*)*)\)\s*Tj/g;
@@ -496,57 +529,74 @@ async function findTagLocations(pdfBytes: Buffer): Promise<TagLocation[]> {
         decompressedText = streamData;
       }
 
-      // Find all tags in this stream
+      // Normalize hex-encoded strings so tag patterns can match
+      const normalizedText = normalizeHexStringsInStream(decompressedText);
+
+      // Find ALL tags in this stream (use global flag to find every occurrence)
       const foundTags: string[] = [];
       for (const pattern of tagPatterns) {
-        const matches = decompressedText.match(pattern);
-        if (matches) foundTags.push(...matches);
+        const globalPattern = new RegExp(pattern.source, 'g');
+        let tagMatch;
+        while ((tagMatch = globalPattern.exec(normalizedText)) !== null) {
+          foundTags.push(tagMatch[0]);
+        }
       }
 
       if (foundTags.length === 0) continue;
 
-      // Determine position based on whether this is a page content or XObject
+      // Extract per-tag positions from Tm/cm operators in the stream
+      const tagResults = extractTagPositionsFromStream(decompressedText, tagPatterns);
+
+      // Determine page index based on whether this is a page content or XObject
       let pageIndex = 0;
       let baseX = 0;
       let baseY = 0;
-      let hasValidPosition = false;
 
       if (streamToPageIndex.has(objNum)) {
-        // This is a page content stream - use positions from Tm/cm in the stream
+        // This is a page content stream
         pageIndex = streamToPageIndex.get(objNum)!;
-        const tagResults = extractTagPositionsFromStream(decompressedText, tagPatterns);
-        for (const result of tagResults) {
-          baseX = result.x;
-          baseY = result.y;
-          hasValidPosition = (baseX > 20 || baseY > 50);
-          break;
-        }
       } else {
-        // This is likely a Form XObject - get placement from our map
+        // Check if this is a Form XObject with known placement
         const placement = xobjectPlacements.get(objNum);
         if (placement) {
           pageIndex = placement.pageIndex;
           baseX = placement.x;
           baseY = placement.y;
-          hasValidPosition = (baseX > 20 || baseY > 50);
           console.log(`[PDF] XObject ${objNum} at page ${pageIndex + 1}, (${baseX.toFixed(1)}, ${baseY.toFixed(1)})`);
+        } else if (pageObjToIndex.size === 0) {
+          // Page objects not found in raw PDF (e.g. pdf-lib uses object streams).
+          // Default to page 1 and rely on Tm positions from extractTagPositionsFromStream.
+          pageIndex = 0;
+          console.log(`[PDF] Stream ${objNum}: page structure not found, defaulting to page 1`);
         }
       }
 
-      // Skip positions that are clearly invalid (0,0 or near origin)
-      if (!hasValidPosition) {
-        console.log(`[PDF] Skipping stream ${objNum} - invalid position (${baseX.toFixed(1)}, ${baseY.toFixed(1)})`);
-        continue;
+      // Build per-tag position map from extractTagPositionsFromStream results
+      // Each result contains the full text (e.g. "Employee Name: {{tag}}") and its position
+      const tagPositions: Array<{ x: number; y: number }> = [];
+      for (const result of tagResults) {
+        tagPositions.push({ x: result.x, y: result.y });
       }
 
-      // Add ALL tags with their positions - NO deduplication!
-      // Each tag instance at each position gets added
-      for (const tag of foundTags) {
+      // Add ALL tags with their individual positions
+      // Use per-tag positions when available, otherwise fall back to baseX/baseY
+      for (let tIdx = 0; tIdx < foundTags.length; tIdx++) {
+        const tag = foundTags[tIdx];
+        const pos = tagPositions[tIdx] || tagPositions[0] || { x: baseX, y: baseY };
+        const x = pos.x || baseX;
+        const y = pos.y || baseY;
+
+        // Skip only if we have no valid position at all
+        if (x < 1 && y < 1) {
+          console.log(`[PDF] Skipping tag "${tag.substring(0, 30)}" - no position found`);
+          continue;
+        }
+
         locations.push({
           tag,
           pageIndex,
-          x: baseX,
-          y: baseY,
+          x,
+          y,
           streamIndex: objNum,
         });
       }
@@ -575,8 +625,7 @@ async function findTagLocations(pdfBytes: Buffer): Promise<TagLocation[]> {
  * IMPORTANT: Creates a placeholder for EACH tag position found.
  * Tags that appear multiple times will have multiple placeholders.
  */
-export async function parseTemplatePlaceholders(pdfPath: string): Promise<Placeholder[]> {
-  const pdfBytes = await fs.readFile(pdfPath);
+export async function parseTemplatePlaceholdersFromBuffer(pdfBytes: Buffer): Promise<Placeholder[]> {
   const placeholders: Placeholder[] = [];
 
   // Find ALL tag locations with their positions
@@ -656,7 +705,7 @@ export async function parseTemplatePlaceholders(pdfPath: string): Promise<Placeh
     });
   }
 
-  console.log(`[PDF] Created ${placeholders.length} placeholders from ${pdfPath}`);
+  console.log(`[PDF] Created ${placeholders.length} placeholders from buffer`);
 
   // Summary by type
   const typeCounts = new Map<string, number>();
@@ -669,6 +718,14 @@ export async function parseTemplatePlaceholders(pdfPath: string): Promise<Placeh
   }
 
   return placeholders;
+}
+
+/**
+ * Parse PDF file from path (legacy convenience wrapper).
+ */
+export async function parseTemplatePlaceholders(pdfPath: string): Promise<Placeholder[]> {
+  const pdfBytes = await fs.readFile(pdfPath);
+  return parseTemplatePlaceholdersFromBuffer(pdfBytes);
 }
 
 /**
@@ -786,7 +843,7 @@ async function replaceTagsWithValues(
     return s.replace(/\\/g, '\\\\').replace(/\(/g, '\\(').replace(/\)/g, '\\)');
   };
 
-  // Replace in compressed streams - find (tag)Tj patterns and style appropriately
+  // Replace in streams - find (tag)Tj and <hex>Tj patterns and style appropriately
   const streamRegex = /stream(\r?\n)([\s\S]*?)(\r?\n)endstream/g;
   const streamReplacements: { start: number; end: number; newContent: string }[] = [];
 
@@ -796,43 +853,61 @@ async function replaceTagsWithValues(
       const streamData = Buffer.from(match[2], 'latin1');
       if (streamData.length > 500000) continue;
 
-      let decompressed: Buffer;
+      let text: string;
+      let isCompressed = false;
       try {
-        decompressed = zlib.inflateSync(streamData);
+        text = zlib.inflateSync(streamData).toString('latin1');
+        isCompressed = true;
       } catch {
-        continue;
+        text = match[2]; // Process uncompressed stream directly
       }
 
-      let text = decompressed.toString('latin1');
+      // Normalize hex-encoded strings <AABB> to literal strings (text)
+      // so tag patterns work regardless of PDF encoding format
+      text = normalizeHexStringsInStream(text);
       let modified = false;
 
-      // Find and replace (tag)Tj patterns with styled text
-      for (const patternSource of tagPatternSources) {
-        // Match the tag inside parentheses followed by Tj
-        const tjPattern = new RegExp(`\\((${patternSource})\\)\\s*Tj`, 'g');
-        text = text.replace(tjPattern, (fullMatch, tag) => {
-          const info = getReplacementInfo(tag);
-          if (info) {
-            modified = true;
-            replacementsCount++;
+      // Find and replace tags in (text)Tj patterns
+      // Handles tags that are the entire text OR embedded within larger text strings
+      const tjPattern = /\(([^)\\]*(?:\\.[^)\\]*)*)\)\s*Tj/g;
+      text = text.replace(tjPattern, (fullMatch, textContent) => {
+        let hasReplacement = false;
+        let isSignature = false;
 
-            if (info.type === 'SIGNATURE') {
-              // Signature: blue color with italic slant for handwritten look
-              // q = save state, cm applies transformation matrix (1 0 0.2 1 0 0 = italic shear)
-              // The matrix [1 0 0.2 1 0 0] creates a 12-degree italic slant
-              return `q 1 0 0.2 1 0 0 cm 0 0 0.8 rg (${escapePdfString(info.value)}) Tj Q 0 0 0 rg`;
-            } else {
-              // Other fields: just blue color
-              return `0 0 1 rg (${escapePdfString(info.value)}) Tj 0 0 0 rg`;
-            }
+        for (const patternSource of tagPatternSources) {
+          const tagRegex = new RegExp(patternSource, 'g');
+          if (tagRegex.test(textContent)) {
+            tagRegex.lastIndex = 0;
+            textContent = textContent.replace(tagRegex, (tag: string) => {
+              const info = getReplacementInfo(tag);
+              if (info) {
+                hasReplacement = true;
+                replacementsCount++;
+                if (info.type === 'SIGNATURE') isSignature = true;
+                return escapePdfString(info.value);
+              }
+              return tag;
+            });
           }
-          return fullMatch;
-        });
+        }
 
-        // Also handle tags that might just be in the stream without Tj (less common)
+        if (hasReplacement) {
+          modified = true;
+          if (isSignature) {
+            // Signature: blue color with italic slant for handwritten look
+            return `q 1 0 0.2 1 0 0 cm 0 0 0.8 rg (${textContent}) Tj Q 0 0 0 rg`;
+          } else {
+            // Other fields: blue color
+            return `0 0 1 rg (${textContent}) Tj 0 0 0 rg`;
+          }
+        }
+        return fullMatch;
+      });
+
+      // Also handle standalone tags not wrapped in (text)Tj
+      for (const patternSource of tagPatternSources) {
         const standalonePattern = new RegExp(patternSource, 'g');
         text = text.replace(standalonePattern, (tag) => {
-          // Only replace if not already handled
           const info = getReplacementInfo(tag);
           if (info) {
             modified = true;
@@ -844,11 +919,16 @@ async function replaceTagsWithValues(
       }
 
       if (modified) {
-        const recompressed = zlib.deflateSync(Buffer.from(text, 'latin1'));
+        let newStreamContent: string;
+        if (isCompressed) {
+          newStreamContent = zlib.deflateSync(Buffer.from(text, 'latin1')).toString('latin1');
+        } else {
+          newStreamContent = text;
+        }
         streamReplacements.push({
           start: match.index,
           end: match.index + match[0].length,
-          newContent: `stream${match[1]}${recompressed.toString('latin1')}${match[3]}endstream`,
+          newContent: `stream${match[1]}${newStreamContent}${match[3]}endstream`,
         });
       }
     } catch {
@@ -885,13 +965,11 @@ async function replaceTagsWithValues(
  * This approach replaces the tag text directly in the content streams,
  * preserving the original position, rotation, and transformation.
  */
-export async function stampSignature(
-  pdfPath: string,
+export async function stampSignatureFromBuffer(
+  originalPdfBytes: Buffer,
   stamps: StampConfig[],
   placeholders: Placeholder[]
 ): Promise<Uint8Array> {
-  const originalPdfBytes = await fs.readFile(pdfPath);
-
   // Build a map of tag types to values
   const valueMap = new Map<string, string>();
 
@@ -903,13 +981,22 @@ export async function stampSignature(
     valueMap.set('SIGNATURE:signer', stamp.signatureData.typedName);
     valueMap.set('SIGNATURE:signer1', stamp.signatureData.typedName);
 
-    // Date value
+    // Date value - set common keys
     const dateValue = stamp.signatureData.textFields?.['Dte1']
       || stamp.signatureData.textFields?.['Date']
       || stamp.timestamp.toLocaleDateString('en-US');
     valueMap.set('DATE:Dte1', dateValue);
     valueMap.set('DATE:Date', dateValue);
     valueMap.set('DATE:date', dateValue);
+
+    // Also map date values from actual placeholder fieldNames
+    // (tags like {{DateA_es_:signer1:date}} have fieldName "DateA")
+    for (const p of placeholders) {
+      if (p.type === 'DATE' && p.fieldName) {
+        const val = stamp.signatureData.textFields?.[p.fieldName] || dateValue;
+        valueMap.set(`DATE:${p.fieldName}`, val);
+      }
+    }
 
     // Text fields (initials, license, etc.)
     if (stamp.signatureData.textFields) {
@@ -931,6 +1018,18 @@ export async function stampSignature(
   console.log('[PDF] Stamping complete');
 
   return pdfDoc.save();
+}
+
+/**
+ * Stamp signatures from a file path (legacy convenience wrapper).
+ */
+export async function stampSignature(
+  pdfPath: string,
+  stamps: StampConfig[],
+  placeholders: Placeholder[]
+): Promise<Uint8Array> {
+  const originalPdfBytes = await fs.readFile(pdfPath);
+  return stampSignatureFromBuffer(originalPdfBytes, stamps, placeholders);
 }
 
 /**

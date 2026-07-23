@@ -1,5 +1,5 @@
 // API client with authentication support
-const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001';
+export const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001';
 
 // Simple fetch wrapper for JSON APIs with credentials
 async function api<T>(endpoint: string, options: RequestInit = {}): Promise<T> {
@@ -127,7 +127,21 @@ export const admin = {
     return api<AuditLog[]>(`/api/admin/audit-logs${query}`);
   },
 
-  users: () => api<User[]>('/api/admin/users'),
+  users: () => api<AdminUser[]>('/api/admin/users'),
+
+  createUser: (data: { email: string; name: string; password: string; role?: 'admin' | 'user' }) =>
+    api<AdminUser>('/api/admin/users', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data),
+    }),
+
+  updateUser: (id: string, data: { role?: 'admin' | 'user'; isActive?: boolean; name?: string }) =>
+    api<AdminUser>(`/api/admin/users/${id}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data),
+    }),
 
   // Form Routes
   formRoutes: {
@@ -225,6 +239,12 @@ export interface User {
   email: string;
   name: string;
   role: 'admin' | 'user';
+}
+
+export interface AdminUser extends User {
+  isActive: boolean;
+  lastLoginAt: string | null;
+  createdAt: string;
 }
 
 export interface UserDocument {

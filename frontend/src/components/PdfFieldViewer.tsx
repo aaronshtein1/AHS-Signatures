@@ -13,7 +13,7 @@ interface PageDims {
 }
 
 interface PdfFieldViewerProps {
-  pdfData: ArrayBuffer | null;
+  pdfUrl: string | null;
   placeholders: Placeholder[];
   signatureData: string | null;
   textFields: Record<string, string>;
@@ -22,7 +22,7 @@ interface PdfFieldViewerProps {
 }
 
 export default function PdfFieldViewer({
-  pdfData,
+  pdfUrl,
   placeholders,
   signatureData,
   textFields,
@@ -80,7 +80,7 @@ export default function PdfFieldViewer({
     };
   };
 
-  if (!pdfData) {
+  if (!pdfUrl) {
     return (
       <div className="flex items-center justify-center py-20">
         <div className="text-center">
@@ -109,7 +109,7 @@ export default function PdfFieldViewer({
   return (
     <div ref={containerRef}>
       <Document
-        file={{ data: new Uint8Array(pdfData) }}
+        file={pdfUrl}
         onLoadSuccess={onDocumentLoadSuccess}
         onLoadError={onDocumentLoadError}
         loading={
@@ -129,7 +129,7 @@ export default function PdfFieldViewer({
         {Array.from({ length: numPages }, (_, i) => {
           const pageNum = i + 1;
           const dims = pageDims[pageNum];
-          const pagePlaceholders = placeholders.filter((p) => p.pageNumber === pageNum);
+          const pagePlaceholders = (placeholders || []).filter((p) => p.pageNumber === pageNum);
 
           return (
             <div

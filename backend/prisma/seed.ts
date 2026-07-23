@@ -1,9 +1,11 @@
-import { PrismaClient } from '@prisma/client';
-import bcrypt from 'bcrypt';
-import fs from 'fs/promises';
-import path from 'path';
+import bcrypt from 'bcryptjs';
+import { drizzle } from 'drizzle-orm/node-postgres';
+import { Pool } from 'pg';
+import { eq } from 'drizzle-orm';
+import * as schema from '../src/db/schema.js';
 
-const prisma = new PrismaClient();
+const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+const db = drizzle(pool, { schema });
 
 const SALT_ROUNDS = 10;
 
@@ -14,17 +16,6 @@ async function hashPassword(password: string): Promise<string> {
 async function main() {
   console.log('Seeding database...');
 
-  // Create upload directories
-  const dirs = ['uploads/packets', 'signed'];
-  for (const dir of dirs) {
-    const fullPath = path.join(process.cwd(), dir);
-    await fs.mkdir(fullPath, { recursive: true });
-  }
-  console.log('Created upload directories');
-
-  // --- Admin user setup ---
-  // In production: use ADMIN_SEED_EMAIL / ADMIN_SEED_PASSWORD env vars
-  // In development: fall back to demo credentials
   const isProduction = process.env.NODE_ENV === 'production';
 
   const adminEmail = process.env.ADMIN_SEED_EMAIL || (isProduction ? '' : 'admin@example.com');
@@ -45,34 +36,41 @@ async function main() {
   }
 
   const adminHash = await hashPassword(adminPassword);
-  const admin = await prisma.user.upsert({
-    where: { email: adminEmail.toLowerCase() },
-    update: {},
-    create: {
+
+  // Upsert admin user
+  let admin = await db.query.users.findFirst({
+    where: eq(schema.users.email, adminEmail.toLowerCase()),
+  });
+
+  if (!admin) {
+    [admin] = await db.insert(schema.users).values({
       email: adminEmail.toLowerCase(),
       passwordHash: adminHash,
       name: adminName,
       role: 'admin',
       isActive: true,
-    },
-  });
-  console.log(`Admin user ready: ${admin.email}`);
+    }).returning();
+  }
+  console.log(`Admin user ready: ${admin!.email}`);
 
   // In development only, create a demo regular user
   if (!isProduction) {
     const userPassword = await hashPassword('user123');
-    const user = await prisma.user.upsert({
-      where: { email: 'user@example.com' },
-      update: {},
-      create: {
+
+    let user = await db.query.users.findFirst({
+      where: eq(schema.users.email, 'user@example.com'),
+    });
+
+    if (!user) {
+      [user] = await db.insert(schema.users).values({
         email: 'user@example.com',
         passwordHash: userPassword,
         name: 'Demo User',
         role: 'user',
         isActive: true,
-      },
-    });
-    console.log(`Demo user ready: ${user.email}`);
+      }).returning();
+    }
+    console.log(`Demo user ready: ${user!.email}`);
 
     console.log('\nDev credentials:');
     console.log('  Admin: admin@example.com / admin123');
@@ -88,5 +86,5 @@ main()
     process.exit(1);
   })
   .finally(async () => {
-    await prisma.$disconnect();
+    await pool.end();
   });

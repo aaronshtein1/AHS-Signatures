@@ -52,3 +52,6 @@ AGENT_COORDINATION.md
 
 # Misc
 *.tgz
+.neon
+
+.vercel

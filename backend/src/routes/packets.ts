@@ -1,12 +1,11 @@
-import { FastifyPluginAsync } from 'fastify';
-import { prisma } from '../utils/prisma.js';
+import { Hono } from 'hono';
+import { db, signingPackets, recipients, auditLogs, eq, and, like, inArray } from '../db/index.js';
 import { generateSecureToken, getTokenExpiryDate, generateSigningUrl } from '../utils/token.js';
 import { sendSigningRequest, sendReminderEmail } from '../services/email.service.js';
-import { parseTemplatePlaceholders, getUniqueRoles, Placeholder } from '../services/pdf.service.js';
+import { parseTemplatePlaceholdersFromBuffer, getUniqueRoles, Placeholder } from '../services/pdf.service.js';
 import { requireAdmin } from '../middleware/auth.middleware.js';
+import { uploadFile, deleteFile } from '../utils/storage.js';
 import { z } from 'zod';
-import fs from 'fs/promises';
-import path from 'path';
 import { v4 as uuidv4 } from 'uuid';
 
 const recipientSchema = z.object({
@@ -21,618 +20,454 @@ const updatePacketSchema = z.object({
   recipients: z.array(recipientSchema).optional(),
 });
 
-export const packetRoutes: FastifyPluginAsync = async (fastify) => {
-  // Protect all packet routes - admin only
-  fastify.addHook('preHandler', requireAdmin);
+export const packetRoutes = new Hono();
 
-  // Bulk assign unassigned packets to a signer
-  fastify.post('/bulk-assign', async (request, reply) => {
-    const bulkSchema = z.object({
-      packetIds: z.array(z.string()).min(1),
-      signerName: z.string().min(1),
-      signerEmail: z.string().email(),
-      signerRole: z.string().min(1).optional(),
-    });
+packetRoutes.use('*', requireAdmin);
 
-    const validation = bulkSchema.safeParse(request.body);
-    if (!validation.success) {
-      return reply.status(400).send({ error: 'Validation failed', details: validation.error.errors });
-    }
-
-    const { packetIds, signerName, signerEmail, signerRole = 'countersigner' } = validation.data;
-
-    const packetsToAssign = await prisma.signingPacket.findMany({
-      where: { id: { in: packetIds }, status: 'pending_assignment' },
-    });
-
-    if (packetsToAssign.length === 0) {
-      return reply.status(400).send({ error: 'No packets found in pending_assignment status' });
-    }
-
-    let assigned = 0;
-    const errors: string[] = [];
-
-    for (const packet of packetsToAssign) {
-      try {
-        const token = generateSecureToken();
-        const tokenExpiresAt = getTokenExpiryDate();
-
-        const recipient = await prisma.recipient.create({
-          data: {
-            packetId: packet.id,
-            roleName: signerRole,
-            name: signerName,
-            email: signerEmail,
-            order: 1,
-            token,
-            tokenExpiresAt,
-            status: 'notified',
-          },
-        });
-
-        await prisma.signingPacket.update({
-          where: { id: packet.id },
-          data: { status: 'sent' },
-        });
-
-        const signingUrl = generateSigningUrl(token);
-        await sendSigningRequest(signerEmail, signerName, packet.name, signingUrl, tokenExpiresAt);
-
-        await prisma.auditLog.create({
-          data: {
-            packetId: packet.id,
-            recipientId: recipient.id,
-            action: 'assigned',
-            details: `Assigned to ${signerName} (${signerEmail})`,
-          },
-        });
-
-        assigned++;
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        errors.push(`Packet ${packet.id}: ${msg}`);
-      }
-    }
-
-    return { success: true, assigned, total: packetIds.length, errors };
+// Bulk assign
+packetRoutes.post('/bulk-assign', async (c) => {
+  const bulkSchema = z.object({
+    packetIds: z.array(z.string()).min(1),
+    signerName: z.string().min(1),
+    signerEmail: z.string().email(),
+    signerRole: z.string().min(1).optional(),
   });
 
-  // List all packets
-  fastify.get<{
-    Querystring: { status?: string; county?: string; formRouteId?: string };
-  }>('/', async (request, reply) => {
-    const { status, county, formRouteId } = request.query;
+  const validation = bulkSchema.safeParse(await c.req.json());
+  if (!validation.success) {
+    return c.json({ error: 'Validation failed', details: validation.error.errors }, 400);
+  }
 
-    const packets = await prisma.signingPacket.findMany({
-      where: {
-        ...(status && { status }),
-        ...(county && { county: { contains: county } }),
-        ...(formRouteId && { formRouteId }),
-      },
-      orderBy: { createdAt: 'desc' },
-      include: {
-        recipients: {
-          orderBy: { order: 'asc' },
-          select: {
-            id: true,
-            roleName: true,
-            name: true,
-            email: true,
-            order: true,
-            status: true,
-            signedAt: true,
-          },
-        },
-        _count: {
-          select: { auditLogs: true },
-        },
-      },
-    });
+  const { packetIds, signerName, signerEmail, signerRole = 'countersigner' } = validation.data;
 
-    return packets.map(p => ({
-      ...p,
-      placeholders: JSON.parse(p.placeholders as string),
-    }));
+  const packetsToAssign = await db.query.signingPackets.findMany({
+    where: and(inArray(signingPackets.id, packetIds), eq(signingPackets.status, 'pending_assignment')),
   });
 
-  // Get single packet
-  fastify.get<{ Params: { id: string } }>('/:id', async (request, reply) => {
-    const { id } = request.params;
+  if (packetsToAssign.length === 0) {
+    return c.json({ error: 'No packets found in pending_assignment status' }, 400);
+  }
 
-    const packet = await prisma.signingPacket.findUnique({
-      where: { id },
-      include: {
-        recipients: {
-          orderBy: { order: 'asc' },
-          include: {
-            signature: {
-              select: {
-                id: true,
-                signatureType: true,
-                typedName: true,
-                createdAt: true,
-              },
-            },
-          },
-        },
-        auditLogs: {
-          orderBy: { createdAt: 'desc' },
-        },
-      },
-    });
+  let assigned = 0;
+  const errors: string[] = [];
 
-    if (!packet) {
-      return reply.status(404).send({ error: 'Packet not found' });
-    }
-
-    return {
-      ...packet,
-      placeholders: JSON.parse(packet.placeholders as string),
-    };
-  });
-
-  // Create new packet with PDF upload
-  fastify.post('/', async (request, reply) => {
-    // With attachFieldsToBody: true, all fields are in request.body
-    const body = request.body as Record<string, any>;
-
-    // Get the file field
-    const fileField = body?.file;
-    if (!fileField || !fileField.toBuffer) {
-      return reply.status(400).send({ error: 'No file uploaded' });
-    }
-
-    if (fileField.mimetype !== 'application/pdf') {
-      return reply.status(400).send({ error: 'Only PDF files are allowed' });
-    }
-
-    // Get form fields (they come as { value: string } objects)
-    const name = body?.name?.value || fileField.filename.replace('.pdf', '');
-    const recipientsJson = body?.recipients?.value;
-
-    if (!recipientsJson) {
-      return reply.status(400).send({ error: 'Recipients are required' });
-    }
-
-    // Parse and validate recipients
-    let recipients: z.infer<typeof recipientSchema>[];
+  for (const packet of packetsToAssign) {
     try {
-      recipients = JSON.parse(recipientsJson);
-      const validation = z.array(recipientSchema).min(1).safeParse(recipients);
-      if (!validation.success) {
-        return reply.status(400).send({
-          error: 'Invalid recipients',
-          details: validation.error.errors,
-        });
-      }
-    } catch (err) {
-      return reply.status(400).send({ error: 'Invalid recipients JSON' });
-    }
+      const token = generateSecureToken();
+      const tokenExpiresAt = getTokenExpiryDate();
 
-    // Generate unique IDs
-    const packetId = uuidv4();
-    const fileId = uuidv4();
-    const fileName = `${fileId}_${fileField.filename}`;
-    const packetDir = path.join(process.cwd(), 'uploads', 'packets', packetId);
-    const filePath = path.join(packetDir, fileName);
+      const [recipient] = await db.insert(recipients).values({
+        packetId: packet.id, roleName: signerRole, name: signerName,
+        email: signerEmail, order: 1, token, tokenExpiresAt, status: 'notified',
+      }).returning();
 
-    // Ensure directory exists and save file
-    await fs.mkdir(packetDir, { recursive: true });
-    const buffer = await fileField.toBuffer();
-    await fs.writeFile(filePath, buffer);
+      await db.update(signingPackets).set({ status: 'sent' }).where(eq(signingPackets.id, packet.id));
 
-    // Parse placeholders from PDF
-    let placeholders: Placeholder[] = [];
-    try {
-      placeholders = await parseTemplatePlaceholders(filePath);
-    } catch (err) {
-      console.error('Failed to parse placeholders:', err);
-    }
+      const signingUrl = generateSigningUrl(token);
+      await sendSigningRequest(signerEmail, signerName, packet.name, signingUrl, tokenExpiresAt);
 
-    // Create packet with embedded PDF info
-    const packet = await prisma.signingPacket.create({
-      data: {
-        id: packetId,
-        name,
-        fileName: fileField.filename,
-        filePath: `packets/${packetId}/${fileName}`,
-        placeholders: JSON.stringify(placeholders),
-        status: 'draft',
-        recipients: {
-          create: recipients.map(r => ({
-            ...r,
-            token: generateSecureToken(),
-            tokenExpiresAt: getTokenExpiryDate(),
-          })),
-        },
-      },
-      include: {
-        recipients: {
-          orderBy: { order: 'asc' },
-        },
-      },
-    });
-
-    // Create audit log
-    await prisma.auditLog.create({
-      data: {
-        packetId: packet.id,
-        action: 'created',
-        details: `Packet "${name}" created with ${recipients.length} recipients`,
-      },
-    });
-
-    const roles = getUniqueRoles(placeholders);
-
-    return {
-      ...packet,
-      placeholders,
-      roles,
-    };
-  });
-
-  // Update packet (only in draft status)
-  fastify.patch<{
-    Params: { id: string };
-    Body: z.infer<typeof updatePacketSchema>;
-  }>('/:id', async (request, reply) => {
-    const { id } = request.params;
-    const validation = updatePacketSchema.safeParse(request.body);
-
-    if (!validation.success) {
-      return reply.status(400).send({
-        error: 'Validation failed',
-        details: validation.error.errors,
+      const admin = c.get('currentUser');
+      await db.insert(auditLogs).values({
+        packetId: packet.id, recipientId: recipient.id, action: 'assigned',
+        details: `Assigned to ${signerName} (${signerEmail}) by ${admin.name} (${admin.email})`,
       });
-    }
 
-    const packet = await prisma.signingPacket.findUnique({
-      where: { id },
-      include: { recipients: true },
-    });
-
-    if (!packet) {
-      return reply.status(404).send({ error: 'Packet not found' });
-    }
-
-    if (packet.status !== 'draft') {
-      return reply.status(400).send({ error: 'Can only update draft packets' });
-    }
-
-    const { name, recipients } = validation.data;
-
-    // Update packet
-    if (recipients) {
-      // Delete existing recipients and create new ones
-      await prisma.recipient.deleteMany({ where: { packetId: id } });
-    }
-
-    const updated = await prisma.signingPacket.update({
-      where: { id },
-      data: {
-        ...(name && { name }),
-        ...(recipients && {
-          recipients: {
-            create: recipients.map(r => ({
-              ...r,
-              token: generateSecureToken(),
-              tokenExpiresAt: getTokenExpiryDate(),
-            })),
-          },
-        }),
-      },
-      include: {
-        recipients: {
-          orderBy: { order: 'asc' },
-        },
-      },
-    });
-
-    return {
-      ...updated,
-      placeholders: JSON.parse(updated.placeholders as string),
-    };
-  });
-
-  // Send packet (trigger signing workflow)
-  fastify.post<{ Params: { id: string } }>('/:id/send', async (request, reply) => {
-    const { id } = request.params;
-
-    const packet = await prisma.signingPacket.findUnique({
-      where: { id },
-      include: {
-        recipients: {
-          orderBy: { order: 'asc' },
-        },
-      },
-    });
-
-    if (!packet) {
-      return reply.status(404).send({ error: 'Packet not found' });
-    }
-
-    if (packet.status !== 'draft') {
-      return reply.status(400).send({ error: 'Packet has already been sent' });
-    }
-
-    if (packet.recipients.length === 0) {
-      return reply.status(400).send({ error: 'Packet has no recipients' });
-    }
-
-    // Find first recipient (order = 1)
-    const firstRecipient = packet.recipients.find(r => r.order === 1);
-    if (!firstRecipient) {
-      return reply.status(400).send({ error: 'No recipient with order 1' });
-    }
-
-    // Generate fresh token for first recipient
-    const token = generateSecureToken();
-    const tokenExpiresAt = getTokenExpiryDate();
-
-    await prisma.recipient.update({
-      where: { id: firstRecipient.id },
-      data: {
-        token,
-        tokenExpiresAt,
-        status: 'notified',
-      },
-    });
-
-    // Send email to first signer
-    const signingUrl = generateSigningUrl(token);
-    await sendSigningRequest(
-      firstRecipient.email,
-      firstRecipient.name,
-      packet.name,
-      signingUrl,
-      tokenExpiresAt
-    );
-
-    // Update packet status
-    await prisma.signingPacket.update({
-      where: { id },
-      data: { status: 'sent' },
-    });
-
-    // Audit log
-    await prisma.auditLog.create({
-      data: {
-        packetId: id,
-        recipientId: firstRecipient.id,
-        action: 'sent',
-        details: `Signing request sent to ${firstRecipient.email}`,
-      },
-    });
-
-    return { success: true, message: 'Signing request sent' };
-  });
-
-  // Resend link to current signer
-  fastify.post<{ Params: { id: string } }>('/:id/resend', async (request, reply) => {
-    const { id } = request.params;
-
-    const packet = await prisma.signingPacket.findUnique({
-      where: { id },
-      include: {
-        recipients: {
-          orderBy: { order: 'asc' },
-        },
-      },
-    });
-
-    if (!packet) {
-      return reply.status(404).send({ error: 'Packet not found' });
-    }
-
-    if (packet.status === 'completed' || packet.status === 'cancelled') {
-      return reply.status(400).send({ error: 'Packet is no longer active' });
-    }
-
-    // Find current pending/notified recipient
-    const currentRecipient = packet.recipients.find(
-      r => r.status === 'notified' || r.status === 'pending'
-    );
-
-    if (!currentRecipient) {
-      return reply.status(400).send({ error: 'No pending recipient found' });
-    }
-
-    // Generate new token (invalidates old one)
-    const token = generateSecureToken();
-    const tokenExpiresAt = getTokenExpiryDate();
-
-    await prisma.recipient.update({
-      where: { id: currentRecipient.id },
-      data: {
-        token,
-        tokenExpiresAt,
-        status: 'notified',
-      },
-    });
-
-    // Send email
-    const signingUrl = generateSigningUrl(token);
-    await sendReminderEmail(
-      currentRecipient.email,
-      currentRecipient.name,
-      packet.name,
-      signingUrl,
-      tokenExpiresAt
-    );
-
-    // Audit log
-    await prisma.auditLog.create({
-      data: {
-        packetId: id,
-        recipientId: currentRecipient.id,
-        action: 'resent',
-        details: `New signing link sent to ${currentRecipient.email}`,
-      },
-    });
-
-    return { success: true, message: 'New signing link sent' };
-  });
-
-  // Cancel packet
-  fastify.post<{ Params: { id: string } }>('/:id/cancel', async (request, reply) => {
-    const { id } = request.params;
-
-    const packet = await prisma.signingPacket.findUnique({ where: { id } });
-
-    if (!packet) {
-      return reply.status(404).send({ error: 'Packet not found' });
-    }
-
-    if (packet.status === 'completed') {
-      return reply.status(400).send({ error: 'Cannot cancel completed packet' });
-    }
-
-    await prisma.signingPacket.update({
-      where: { id },
-      data: { status: 'cancelled' },
-    });
-
-    // Audit log
-    await prisma.auditLog.create({
-      data: {
-        packetId: id,
-        action: 'cancelled',
-        details: 'Packet cancelled by admin',
-      },
-    });
-
-    return { success: true };
-  });
-
-  // Delete packet (only drafts)
-  fastify.delete<{ Params: { id: string } }>('/:id', async (request, reply) => {
-    const { id } = request.params;
-
-    const packet = await prisma.signingPacket.findUnique({ where: { id } });
-
-    if (!packet) {
-      return reply.status(404).send({ error: 'Packet not found' });
-    }
-
-    if (packet.status !== 'draft') {
-      return reply.status(400).send({ error: 'Can only delete draft packets' });
-    }
-
-    // Delete PDF file
-    try {
-      const fullPath = path.join(process.cwd(), 'uploads', packet.filePath);
-      await fs.unlink(fullPath);
-      // Try to remove the packet directory if empty
-      const packetDir = path.dirname(fullPath);
-      await fs.rmdir(packetDir);
+      assigned++;
     } catch (err) {
-      console.error('Failed to delete packet file:', err);
+      errors.push(`Packet ${packet.id}: ${err instanceof Error ? err.message : String(err)}`);
     }
+  }
 
-    await prisma.signingPacket.delete({ where: { id } });
+  return c.json({ success: true, assigned, total: packetIds.length, errors });
+});
 
-    return { success: true };
+// List all packets
+packetRoutes.get('/', async (c) => {
+  const status = c.req.query('status');
+  const county = c.req.query('county');
+  const formRouteId = c.req.query('formRouteId');
+
+  const conditions = [];
+  if (status) conditions.push(eq(signingPackets.status, status));
+  if (county) conditions.push(like(signingPackets.county, `%${county}%`));
+  if (formRouteId) conditions.push(eq(signingPackets.formRouteId, formRouteId));
+
+  const packets = await db.query.signingPackets.findMany({
+    where: conditions.length > 0 ? and(...conditions) : undefined,
+    orderBy: (t, { desc }) => [desc(t.createdAt)],
+    with: {
+      recipients: {
+        orderBy: (r, { asc }) => [asc(r.order)],
+        columns: { id: true, roleName: true, name: true, email: true, order: true, status: true, signedAt: true },
+      },
+      auditLogs: { columns: { id: true } },
+    },
   });
 
-  // Reassign a pending/notified recipient to a different person
-  fastify.post<{
-    Params: { id: string; recipientId: string };
-    Body: { name: string; email: string };
-  }>('/:id/recipients/:recipientId/reassign', async (request, reply) => {
-    const { id, recipientId } = request.params;
-    const { name, email } = request.body as { name: string; email: string };
+  return c.json(packets.map(p => {
+    const { auditLogs: logs, ...rest } = p;
+    return {
+      ...rest,
+      _count: { auditLogs: logs.length },
+      placeholders: JSON.parse(rest.placeholders as string),
+    };
+  }));
+});
 
-    if (!name || !email) {
-      return reply.status(400).send({ error: 'Name and email are required' });
-    }
-
-    const packet = await prisma.signingPacket.findUnique({
-      where: { id },
-      include: { recipients: { orderBy: { order: 'asc' } } },
-    });
-
-    if (!packet) {
-      return reply.status(404).send({ error: 'Packet not found' });
-    }
-
-    if (packet.status === 'completed' || packet.status === 'cancelled') {
-      return reply.status(400).send({ error: 'Packet is no longer active' });
-    }
-
-    const recipient = packet.recipients.find(r => r.id === recipientId);
-    if (!recipient) {
-      return reply.status(404).send({ error: 'Recipient not found' });
-    }
-
-    if (recipient.status === 'signed') {
-      return reply.status(400).send({ error: 'Cannot reassign a recipient who has already signed' });
-    }
-
-    const oldName = recipient.name;
-    const oldEmail = recipient.email;
-
-    // Generate new token and update recipient
-    const token = generateSecureToken();
-    const tokenExpiresAt = getTokenExpiryDate();
-
-    await prisma.recipient.update({
-      where: { id: recipientId },
-      data: {
-        name,
-        email,
-        token,
-        tokenExpiresAt,
-        status: 'notified',
-      },
-    });
-
-    // Send signing email to new person
-    const signingUrl = generateSigningUrl(token);
-    await sendSigningRequest(email, name, packet.name, signingUrl, tokenExpiresAt);
-
-    // Audit log
-    await prisma.auditLog.create({
-      data: {
-        packetId: id,
-        recipientId,
-        action: 'reassigned',
-        details: `Reassigned from ${oldName} (${oldEmail}) to ${name} (${email})`,
-      },
-    });
-
-    return { success: true, message: `Reassigned to ${name} and sent signing request` };
-  });
-
-  // Get packet timeline/audit log
-  fastify.get<{ Params: { id: string } }>('/:id/timeline', async (request, reply) => {
-    const { id } = request.params;
-
-    const logs = await prisma.auditLog.findMany({
-      where: { packetId: id },
-      orderBy: { createdAt: 'desc' },
-      include: {
-        recipient: {
-          select: { name: true, email: true, roleName: true },
+// Get single packet
+packetRoutes.get('/:id', async (c) => {
+  const packet = await db.query.signingPackets.findFirst({
+    where: eq(signingPackets.id, c.req.param('id')),
+    with: {
+      recipients: {
+        orderBy: (r, { asc }) => [asc(r.order)],
+        with: {
+          signature: {
+            columns: { id: true, signatureType: true, typedName: true, createdAt: true },
+          },
         },
       },
-    });
-
-    return logs;
+      auditLogs: {
+        orderBy: (a, { desc }) => [desc(a.createdAt)],
+      },
+    },
   });
 
-  // Get packet roles (from placeholders)
-  fastify.get<{ Params: { id: string } }>('/:id/roles', async (request, reply) => {
-    const { id } = request.params;
+  if (!packet) return c.json({ error: 'Packet not found' }, 404);
 
-    const packet = await prisma.signingPacket.findUnique({ where: { id } });
+  return c.json({ ...packet, placeholders: JSON.parse(packet.placeholders as string) });
+});
 
-    if (!packet) {
-      return reply.status(404).send({ error: 'Packet not found' });
+// Create new packet with PDF upload
+packetRoutes.post('/', async (c) => {
+  const body = await c.req.parseBody({ all: true });
+
+  const fileField = body.file as File | undefined;
+  if (!fileField || !(fileField instanceof File)) {
+    return c.json({ error: 'No file uploaded' }, 400);
+  }
+
+  if (fileField.type !== 'application/pdf') {
+    return c.json({ error: 'Only PDF files are allowed' }, 400);
+  }
+
+  const name = (body.name as string) || fileField.name.replace('.pdf', '');
+  const recipientsJson = body.recipients as string;
+
+  if (!recipientsJson) {
+    return c.json({ error: 'Recipients are required' }, 400);
+  }
+
+  let recipientList: z.infer<typeof recipientSchema>[];
+  try {
+    recipientList = JSON.parse(recipientsJson);
+    const validation = z.array(recipientSchema).min(1).safeParse(recipientList);
+    if (!validation.success) {
+      return c.json({ error: 'Invalid recipients', details: validation.error.errors }, 400);
     }
+  } catch {
+    return c.json({ error: 'Invalid recipients JSON' }, 400);
+  }
 
-    const placeholders = JSON.parse(packet.placeholders as string);
-    const roles = getUniqueRoles(placeholders);
+  const packetId = uuidv4();
+  const fileId = uuidv4();
+  const fileName = `${fileId}_${fileField.name}`;
+  const storageKey = `packets/${packetId}/${fileName}`;
 
-    return { roles, placeholders };
+  const buffer = Buffer.from(await fileField.arrayBuffer());
+  await uploadFile(storageKey, buffer);
+
+  let placeholders: Placeholder[] = [];
+  try {
+    placeholders = await parseTemplatePlaceholdersFromBuffer(buffer);
+  } catch (err) {
+    console.error('Failed to parse placeholders:', err);
+  }
+
+  const packet = await db.transaction(async (tx) => {
+    const [pkt] = await tx.insert(signingPackets).values({
+      id: packetId,
+      name,
+      fileName: fileField.name,
+      filePath: storageKey,
+      placeholders: JSON.stringify(placeholders),
+      status: 'draft',
+    }).returning();
+
+    const recs = await tx.insert(recipients).values(
+      recipientList.map(r => ({
+        ...r,
+        packetId,
+        token: generateSecureToken(),
+        tokenExpiresAt: getTokenExpiryDate(),
+      }))
+    ).returning();
+
+    return { ...pkt, recipients: recs.sort((a, b) => a.order - b.order) };
   });
-};
+
+  const admin = c.get('currentUser');
+  await db.insert(auditLogs).values({
+    packetId: packet.id, action: 'created',
+    details: `Packet "${name}" created with ${recipientList.length} recipients by ${admin.name} (${admin.email})`,
+  });
+
+  const roles = getUniqueRoles(placeholders);
+
+  return c.json({ ...packet, placeholders, roles });
+});
+
+// Update packet (only drafts)
+packetRoutes.patch('/:id', async (c) => {
+  const id = c.req.param('id');
+  const validation = updatePacketSchema.safeParse(await c.req.json());
+  if (!validation.success) {
+    return c.json({ error: 'Validation failed', details: validation.error.errors }, 400);
+  }
+
+  const packet = await db.query.signingPackets.findFirst({
+    where: eq(signingPackets.id, id),
+    with: { recipients: true },
+  });
+  if (!packet) return c.json({ error: 'Packet not found' }, 404);
+  if (packet.status !== 'draft') return c.json({ error: 'Can only update draft packets' }, 400);
+
+  const { name, recipients: recipientList } = validation.data;
+
+  if (recipientList) {
+    await db.delete(recipients).where(eq(recipients.packetId, id));
+  }
+
+  if (name) {
+    await db.update(signingPackets).set({ name }).where(eq(signingPackets.id, id));
+  }
+
+  if (recipientList) {
+    await db.insert(recipients).values(
+      recipientList.map(r => ({
+        ...r,
+        packetId: id,
+        token: generateSecureToken(),
+        tokenExpiresAt: getTokenExpiryDate(),
+      }))
+    );
+  }
+
+  const admin = c.get('currentUser');
+  const changes: string[] = [];
+  if (name) changes.push(`name to "${name}"`);
+  if (recipientList) changes.push(`recipients (${recipientList.length})`);
+  await db.insert(auditLogs).values({
+    packetId: id, action: 'updated',
+    details: `Packet updated: ${changes.join(', ')} by ${admin.name} (${admin.email})`,
+  });
+
+  const updated = await db.query.signingPackets.findFirst({
+    where: eq(signingPackets.id, id),
+    with: {
+      recipients: {
+        orderBy: (r, { asc }) => [asc(r.order)],
+      },
+    },
+  });
+
+  return c.json({ ...updated!, placeholders: JSON.parse(updated!.placeholders as string) });
+});
+
+// Send packet
+packetRoutes.post('/:id/send', async (c) => {
+  const id = c.req.param('id');
+
+  const packet = await db.query.signingPackets.findFirst({
+    where: eq(signingPackets.id, id),
+    with: {
+      recipients: {
+        orderBy: (r, { asc }) => [asc(r.order)],
+      },
+    },
+  });
+
+  if (!packet) return c.json({ error: 'Packet not found' }, 404);
+  if (packet.status !== 'draft') return c.json({ error: 'Packet has already been sent' }, 400);
+  if (packet.recipients.length === 0) return c.json({ error: 'Packet has no recipients' }, 400);
+
+  const firstRecipient = packet.recipients.find(r => r.order === 1);
+  if (!firstRecipient) return c.json({ error: 'No recipient with order 1' }, 400);
+
+  const token = generateSecureToken();
+  const tokenExpiresAt = getTokenExpiryDate();
+
+  await db.update(recipients)
+    .set({ token, tokenExpiresAt, status: 'notified' })
+    .where(eq(recipients.id, firstRecipient.id));
+
+  const signingUrl = generateSigningUrl(token);
+  await sendSigningRequest(firstRecipient.email, firstRecipient.name, packet.name, signingUrl, tokenExpiresAt);
+
+  await db.update(signingPackets).set({ status: 'sent' }).where(eq(signingPackets.id, id));
+
+  const admin = c.get('currentUser');
+  await db.insert(auditLogs).values({
+    packetId: id, recipientId: firstRecipient.id, action: 'sent',
+    details: `Signing request sent to ${firstRecipient.email} by ${admin.name} (${admin.email})`,
+  });
+
+  return c.json({ success: true, message: 'Signing request sent' });
+});
+
+// Resend link
+packetRoutes.post('/:id/resend', async (c) => {
+  const id = c.req.param('id');
+
+  const packet = await db.query.signingPackets.findFirst({
+    where: eq(signingPackets.id, id),
+    with: {
+      recipients: {
+        orderBy: (r, { asc }) => [asc(r.order)],
+      },
+    },
+  });
+
+  if (!packet) return c.json({ error: 'Packet not found' }, 404);
+  if (packet.status === 'completed' || packet.status === 'cancelled') {
+    return c.json({ error: 'Packet is no longer active' }, 400);
+  }
+
+  const currentRecipient = packet.recipients.find(r => r.status === 'notified' || r.status === 'pending');
+  if (!currentRecipient) return c.json({ error: 'No pending recipient found' }, 400);
+
+  const token = generateSecureToken();
+  const tokenExpiresAt = getTokenExpiryDate();
+
+  await db.update(recipients)
+    .set({ token, tokenExpiresAt, status: 'notified' })
+    .where(eq(recipients.id, currentRecipient.id));
+
+  const signingUrl = generateSigningUrl(token);
+  await sendReminderEmail(currentRecipient.email, currentRecipient.name, packet.name, signingUrl, tokenExpiresAt);
+
+  const admin = c.get('currentUser');
+  await db.insert(auditLogs).values({
+    packetId: id, recipientId: currentRecipient.id, action: 'resent',
+    details: `New signing link sent to ${currentRecipient.email} by ${admin.name} (${admin.email})`,
+  });
+
+  return c.json({ success: true, message: 'New signing link sent' });
+});
+
+// Cancel packet
+packetRoutes.post('/:id/cancel', async (c) => {
+  const id = c.req.param('id');
+  const packet = await db.query.signingPackets.findFirst({
+    where: eq(signingPackets.id, id),
+  });
+
+  if (!packet) return c.json({ error: 'Packet not found' }, 404);
+  if (packet.status === 'completed') return c.json({ error: 'Cannot cancel completed packet' }, 400);
+
+  const admin = c.get('currentUser');
+  await db.update(signingPackets).set({ status: 'cancelled' }).where(eq(signingPackets.id, id));
+  await db.insert(auditLogs).values({
+    packetId: id, action: 'cancelled',
+    details: `Packet cancelled by ${admin.name} (${admin.email})`,
+  });
+
+  return c.json({ success: true });
+});
+
+// Delete draft packet
+packetRoutes.delete('/:id', async (c) => {
+  const id = c.req.param('id');
+  const packet = await db.query.signingPackets.findFirst({
+    where: eq(signingPackets.id, id),
+  });
+
+  if (!packet) return c.json({ error: 'Packet not found' }, 404);
+  if (packet.status !== 'draft') return c.json({ error: 'Can only delete draft packets' }, 400);
+
+  const admin = c.get('currentUser');
+  console.log(`[Audit] Draft packet "${packet.name}" (${id}) deleted by ${admin.name} (${admin.email})`);
+
+  try {
+    await deleteFile(packet.filePath);
+  } catch (err) {
+    console.error('Failed to delete packet file:', err);
+  }
+
+  await db.delete(signingPackets).where(eq(signingPackets.id, id));
+  return c.json({ success: true });
+});
+
+// Reassign recipient
+packetRoutes.post('/:id/recipients/:recipientId/reassign', async (c) => {
+  const id = c.req.param('id');
+  const recipientId = c.req.param('recipientId');
+  const { name, email } = await c.req.json() as { name: string; email: string };
+
+  if (!name || !email) return c.json({ error: 'Name and email are required' }, 400);
+
+  const packet = await db.query.signingPackets.findFirst({
+    where: eq(signingPackets.id, id),
+    with: {
+      recipients: {
+        orderBy: (r, { asc }) => [asc(r.order)],
+      },
+    },
+  });
+
+  if (!packet) return c.json({ error: 'Packet not found' }, 404);
+  if (packet.status === 'completed' || packet.status === 'cancelled') {
+    return c.json({ error: 'Packet is no longer active' }, 400);
+  }
+
+  const recipient = packet.recipients.find(r => r.id === recipientId);
+  if (!recipient) return c.json({ error: 'Recipient not found' }, 404);
+  if (recipient.status === 'signed') return c.json({ error: 'Cannot reassign a recipient who has already signed' }, 400);
+
+  const oldName = recipient.name;
+  const oldEmail = recipient.email;
+
+  const token = generateSecureToken();
+  const tokenExpiresAt = getTokenExpiryDate();
+
+  await db.update(recipients)
+    .set({ name, email, token, tokenExpiresAt, status: 'notified' })
+    .where(eq(recipients.id, recipientId));
+
+  const signingUrl = generateSigningUrl(token);
+  await sendSigningRequest(email, name, packet.name, signingUrl, tokenExpiresAt);
+
+  const admin = c.get('currentUser');
+  await db.insert(auditLogs).values({
+    packetId: id, recipientId, action: 'reassigned',
+    details: `Reassigned from ${oldName} (${oldEmail}) to ${name} (${email}) by ${admin.name} (${admin.email})`,
+  });
+
+  return c.json({ success: true, message: `Reassigned to ${name} and sent signing request` });
+});
+
+// Get packet timeline
+packetRoutes.get('/:id/timeline', async (c) => {
+  const logs = await db.query.auditLogs.findMany({
+    where: eq(auditLogs.packetId, c.req.param('id')),
+    orderBy: (a, { desc }) => [desc(a.createdAt)],
+    with: {
+      recipient: {
+        columns: { name: true, email: true, roleName: true },
+      },
+    },
+  });
+  return c.json(logs);
+});
+
+// Get packet roles
+packetRoutes.get('/:id/roles', async (c) => {
+  const packet = await db.query.signingPackets.findFirst({
+    where: eq(signingPackets.id, c.req.param('id')),
+  });
+  if (!packet) return c.json({ error: 'Packet not found' }, 404);
+
+  const placeholders = JSON.parse(packet.placeholders as string);
+  const roles = getUniqueRoles(placeholders);
+  return c.json({ roles, placeholders });
+});

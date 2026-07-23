@@ -1,656 +1,551 @@
-import { FastifyPluginAsync } from 'fastify';
-import { prisma } from '../utils/prisma.js';
+import { Hono } from 'hono';
+import { z } from 'zod';
+import {
+  db, users, signingPackets, recipients, auditLogs, formRoutes,
+  eq, and, desc, asc, gte, lte, isNotNull, count, sql,
+} from '../db/index.js';
 import { requireAdmin } from '../middleware/auth.middleware.js';
+import { authService } from '../services/auth.service.js';
 import {
   isSharePointConfigured,
   testSharePointConnection,
   uploadToSharePoint,
   refreshFolderCache,
 } from '../services/sharepoint.service.js';
-import fs from 'fs/promises';
-import path from 'path';
+import { downloadFile } from '../utils/storage.js';
 
-export const adminRoutes: FastifyPluginAsync = async (fastify) => {
-  // Protect all admin routes
-  fastify.addHook('preHandler', requireAdmin);
+export const adminRoutes = new Hono();
 
-  // GET /users - list all users
-  fastify.get('/users', async () => {
-    const users = await prisma.user.findMany({
-      select: { id: true, email: true, name: true, role: true, isActive: true },
-      orderBy: { name: 'asc' },
+adminRoutes.use('*', requireAdmin);
+
+// GET /users
+adminRoutes.get('/users', async (c) => {
+  const userList = await db.query.users.findMany({
+    columns: { id: true, email: true, name: true, role: true, isActive: true, lastLoginAt: true, createdAt: true },
+    orderBy: (t, { asc }) => [asc(t.name)],
+  });
+  return c.json(userList);
+});
+
+// POST /users — create a new user
+const createUserSchema = z.object({
+  email: z.string().email(),
+  name: z.string().min(1),
+  password: z.string().min(6),
+  role: z.enum(['admin', 'user']).optional(),
+});
+
+adminRoutes.post('/users', async (c) => {
+  try {
+    const body = createUserSchema.parse(await c.req.json());
+
+    const existing = await authService.findUserByEmail(body.email);
+    if (existing) {
+      return c.json({ error: 'A user with this email already exists' }, 400);
+    }
+
+    const user = await authService.createUser({
+      email: body.email,
+      password: body.password,
+      name: body.name,
+      role: body.role || 'user',
     });
-    return users;
-  });
 
-  // Dashboard stats
-  fastify.get('/stats', async (request, reply) => {
-    const [
-      packetsByStatus,
-      recentActivity,
-    ] = await Promise.all([
-      prisma.signingPacket.groupBy({
-        by: ['status'],
-        _count: true,
-      }),
-      prisma.auditLog.findMany({
-        orderBy: { createdAt: 'desc' },
-        take: 10,
-        include: {
-          packet: { select: { name: true } },
-          recipient: { select: { name: true, email: true } },
-        },
-      }),
-    ]);
+    return c.json(user, 201);
+  } catch (err) {
+    if (err instanceof z.ZodError) {
+      return c.json({ error: 'Invalid input', details: err.errors }, 400);
+    }
+    console.error('[Admin] Create user error:', err);
+    return c.json({ error: 'Failed to create user' }, 500);
+  }
+});
 
-    const statusCounts: Record<string, number> = {
-      draft: 0,
-      pending_assignment: 0,
-      sent: 0,
-      in_progress: 0,
-      completed: 0,
-      cancelled: 0,
-    };
+// PATCH /users/:id — update user role, status, or name
+const updateUserSchema = z.object({
+  role: z.enum(['admin', 'user']).optional(),
+  isActive: z.boolean().optional(),
+  name: z.string().min(1).optional(),
+});
 
-    for (const item of packetsByStatus) {
-      statusCounts[item.status] = item._count;
+adminRoutes.patch('/users/:id', async (c) => {
+  try {
+    const userId = c.req.param('id');
+    const body = updateUserSchema.parse(await c.req.json());
+    const currentUser = c.get('currentUser') as { id: string };
+
+    // Prevent admin from deactivating themselves
+    if (userId === currentUser.id && body.isActive === false) {
+      return c.json({ error: 'You cannot deactivate your own account' }, 400);
+    }
+    if (userId === currentUser.id && body.role === 'user') {
+      return c.json({ error: 'You cannot remove your own admin role' }, 400);
     }
 
-    return {
-      packets: statusCounts,
-      totalPackets: Object.values(statusCounts).reduce((a, b) => a + b, 0),
-      recentActivity,
-    };
-  });
-
-  // Analytics endpoint for dashboard charts and KPIs
-  fastify.get<{
-    Querystring: { days?: string; formRouteId?: string; county?: string };
-  }>('/analytics', async (request) => {
-    const days = Math.min(Math.max(parseInt(request.query.days || '30', 10) || 30, 1), 365);
-    const { formRouteId, county } = request.query;
-
-    const startDate = new Date();
-    startDate.setDate(startDate.getDate() - days);
-    startDate.setHours(0, 0, 0, 0);
-
-    // Run all queries in parallel
-    const [packets, formRoutes, needsAttention, recentActivity, distinctCounties] = await Promise.all([
-      // 1. All packets in date range (with filters)
-      prisma.signingPacket.findMany({
-        where: {
-          createdAt: { gte: startDate },
-          ...(formRouteId ? { formRouteId } : {}),
-          ...(county ? { county: { contains: county } } : {}),
-        },
-        select: {
-          id: true, name: true, status: true, county: true,
-          formRouteId: true, employeeName: true,
-          createdAt: true, completedAt: true,
-        },
-      }),
-      // 2. All form routes for name lookup
-      prisma.formRoute.findMany({
-        select: { id: true, formName: true },
-      }),
-      // 3. Unassigned packets for "needs attention"
-      prisma.signingPacket.findMany({
-        where: { status: 'pending_assignment' },
-        orderBy: { createdAt: 'asc' },
-        take: 25,
-        select: {
-          id: true, name: true, employeeName: true,
-          county: true, formRouteId: true, createdAt: true,
-        },
-      }),
-      // 4. Recent activity
-      prisma.auditLog.findMany({
-        orderBy: { createdAt: 'desc' },
-        take: 20,
-        include: {
-          packet: { select: { name: true } },
-          recipient: { select: { name: true, email: true } },
-        },
-      }),
-      // 5. Distinct counties
-      prisma.signingPacket.findMany({
-        where: { county: { not: null } },
-        select: { county: true },
-        distinct: ['county'],
-        orderBy: { county: 'asc' },
-      }),
-    ]);
-
-    // Build form route lookup
-    const routeMap = new Map(formRoutes.map(r => [r.id, r.formName]));
-
-    // --- KPIs ---
-    const statusLabels: Record<string, string> = {
-      draft: 'Draft',
-      pending_assignment: 'Unassigned',
-      sent: 'Sent',
-      in_progress: 'In Progress',
-      completed: 'Completed',
-      cancelled: 'Cancelled',
-    };
-
-    let needsAssignment = 0;
-    let inProgress = 0;
-    let completed = 0;
-    let totalCompletionMs = 0;
-    let completionCount = 0;
-
-    const statusCounts: Record<string, number> = {};
-    for (const s of Object.keys(statusLabels)) statusCounts[s] = 0;
-
-    // --- Trend buckets ---
-    const trendMap = new Map<string, { created: number; completed: number }>();
-    // Pre-fill all days
-    for (let i = 0; i < days; i++) {
-      const d = new Date();
-      d.setDate(d.getDate() - (days - 1 - i));
-      const key = d.toISOString().split('T')[0];
-      trendMap.set(key, { created: 0, completed: 0 });
+    const existing = await db.query.users.findFirst({ where: eq(users.id, userId) });
+    if (!existing) {
+      return c.json({ error: 'User not found' }, 404);
     }
 
-    // --- By form route ---
-    const routeBreakdown = new Map<string | null, Record<string, number>>();
-    // --- By county ---
-    const countyBreakdown = new Map<string, { count: number; completed: number }>();
+    const updates: Record<string, unknown> = {};
+    if (body.role !== undefined) updates.role = body.role;
+    if (body.isActive !== undefined) updates.isActive = body.isActive;
+    if (body.name !== undefined) updates.name = body.name;
 
-    // Single pass over packets
-    for (const pkt of packets) {
-      const s = pkt.status;
-      statusCounts[s] = (statusCounts[s] || 0) + 1;
-      if (s === 'pending_assignment') needsAssignment++;
-      if (s === 'sent' || s === 'in_progress') inProgress++;
-      if (s === 'completed') {
-        completed++;
-        if (pkt.completedAt) {
-          totalCompletionMs += new Date(pkt.completedAt).getTime() - new Date(pkt.createdAt).getTime();
-          completionCount++;
-        }
-      }
+    if (Object.keys(updates).length === 0) {
+      return c.json({ error: 'No fields to update' }, 400);
+    }
 
-      // Trend: created
-      const createdDay = new Date(pkt.createdAt).toISOString().split('T')[0];
-      const createdBucket = trendMap.get(createdDay);
-      if (createdBucket) createdBucket.created++;
+    const [updated] = await db.update(users)
+      .set(updates)
+      .where(eq(users.id, userId))
+      .returning({
+        id: users.id,
+        email: users.email,
+        name: users.name,
+        role: users.role,
+        isActive: users.isActive,
+      });
 
-      // Trend: completed
+    return c.json(updated);
+  } catch (err) {
+    if (err instanceof z.ZodError) {
+      return c.json({ error: 'Invalid input', details: err.errors }, 400);
+    }
+    console.error('[Admin] Update user error:', err);
+    return c.json({ error: 'Failed to update user' }, 500);
+  }
+});
+
+// GET /stats
+adminRoutes.get('/stats', async (c) => {
+  const [packetsByStatus, recentActivity] = await Promise.all([
+    db.select({ status: signingPackets.status, _count: count() })
+      .from(signingPackets)
+      .groupBy(signingPackets.status),
+    db.query.auditLogs.findMany({
+      orderBy: (a, { desc }) => [desc(a.createdAt)],
+      limit: 10,
+      with: {
+        packet: { columns: { name: true } },
+        recipient: { columns: { name: true, email: true } },
+      },
+    }),
+  ]);
+
+  const statusCounts: Record<string, number> = {
+    draft: 0, pending_assignment: 0, sent: 0, in_progress: 0, completed: 0, cancelled: 0,
+  };
+  for (const item of packetsByStatus) {
+    statusCounts[item.status] = Number(item._count);
+  }
+
+  return c.json({
+    packets: statusCounts,
+    totalPackets: Object.values(statusCounts).reduce((a, b) => a + b, 0),
+    recentActivity,
+  });
+});
+
+// GET /analytics
+adminRoutes.get('/analytics', async (c) => {
+  const days = Math.min(Math.max(parseInt(c.req.query('days') || '30', 10) || 30, 1), 365);
+  const formRouteId = c.req.query('formRouteId');
+  const county = c.req.query('county');
+
+  const startDate = new Date();
+  startDate.setDate(startDate.getDate() - days);
+  startDate.setHours(0, 0, 0, 0);
+
+  // Build packet query conditions
+  const packetConditions = [gte(signingPackets.createdAt, startDate)];
+  if (formRouteId) packetConditions.push(eq(signingPackets.formRouteId, formRouteId));
+  if (county) packetConditions.push(sql`${signingPackets.county} LIKE ${'%' + county + '%'}`);
+
+  const [packets, formRouteList, needsAttention, recentActivity, distinctCounties] = await Promise.all([
+    db.query.signingPackets.findMany({
+      where: and(...packetConditions),
+      columns: {
+        id: true, name: true, status: true, county: true,
+        formRouteId: true, employeeName: true,
+        createdAt: true, completedAt: true,
+      },
+    }),
+    db.query.formRoutes.findMany({
+      columns: { id: true, formName: true },
+    }),
+    db.query.signingPackets.findMany({
+      where: eq(signingPackets.status, 'pending_assignment'),
+      orderBy: (t, { asc }) => [asc(t.createdAt)],
+      limit: 25,
+      columns: { id: true, name: true, employeeName: true, county: true, formRouteId: true, createdAt: true },
+    }),
+    db.query.auditLogs.findMany({
+      orderBy: (a, { desc }) => [desc(a.createdAt)],
+      limit: 20,
+      with: {
+        packet: { columns: { name: true } },
+        recipient: { columns: { name: true, email: true } },
+      },
+    }),
+    db.selectDistinct({ county: signingPackets.county })
+      .from(signingPackets)
+      .where(isNotNull(signingPackets.county))
+      .orderBy(asc(signingPackets.county)),
+  ]);
+
+  const routeMap = new Map(formRouteList.map(r => [r.id, r.formName]));
+  const statusLabels: Record<string, string> = {
+    draft: 'Draft', pending_assignment: 'Unassigned', sent: 'Sent',
+    in_progress: 'In Progress', completed: 'Completed', cancelled: 'Cancelled',
+  };
+
+  let needsAssignment = 0, inProgress = 0, completed = 0;
+  let totalCompletionMs = 0, completionCount = 0;
+  const statusCounts: Record<string, number> = {};
+  for (const s of Object.keys(statusLabels)) statusCounts[s] = 0;
+
+  const trendMap = new Map<string, { created: number; completed: number }>();
+  for (let i = 0; i < days; i++) {
+    const d = new Date();
+    d.setDate(d.getDate() - (days - 1 - i));
+    trendMap.set(d.toISOString().split('T')[0], { created: 0, completed: 0 });
+  }
+
+  const routeBreakdown = new Map<string | null, Record<string, number>>();
+  const countyBreakdown = new Map<string, { count: number; completed: number }>();
+
+  for (const pkt of packets) {
+    const s = pkt.status;
+    statusCounts[s] = (statusCounts[s] || 0) + 1;
+    if (s === 'pending_assignment') needsAssignment++;
+    if (s === 'sent' || s === 'in_progress') inProgress++;
+    if (s === 'completed') {
+      completed++;
       if (pkt.completedAt) {
-        const completedDay = new Date(pkt.completedAt).toISOString().split('T')[0];
-        const completedBucket = trendMap.get(completedDay);
-        if (completedBucket) completedBucket.completed++;
+        totalCompletionMs += new Date(pkt.completedAt).getTime() - new Date(pkt.createdAt).getTime();
+        completionCount++;
       }
-
-      // By form route
-      const routeKey = pkt.formRouteId;
-      if (!routeBreakdown.has(routeKey)) {
-        routeBreakdown.set(routeKey, { draft: 0, pending_assignment: 0, sent: 0, in_progress: 0, completed: 0, cancelled: 0, total: 0 });
-      }
-      const rb = routeBreakdown.get(routeKey)!;
-      rb[s] = (rb[s] || 0) + 1;
-      rb.total++;
-
-      // By county
-      const c = pkt.county || 'Unknown';
-      if (!countyBreakdown.has(c)) {
-        countyBreakdown.set(c, { count: 0, completed: 0 });
-      }
-      const cb = countyBreakdown.get(c)!;
-      cb.count++;
-      if (s === 'completed') cb.completed++;
     }
 
-    // Build response
-    const statusDistribution = Object.entries(statusCounts)
+    const createdDay = new Date(pkt.createdAt).toISOString().split('T')[0];
+    const createdBucket = trendMap.get(createdDay);
+    if (createdBucket) createdBucket.created++;
+
+    if (pkt.completedAt) {
+      const completedDay = new Date(pkt.completedAt).toISOString().split('T')[0];
+      const completedBucket = trendMap.get(completedDay);
+      if (completedBucket) completedBucket.completed++;
+    }
+
+    const routeKey = pkt.formRouteId;
+    if (!routeBreakdown.has(routeKey)) {
+      routeBreakdown.set(routeKey, { draft: 0, pending_assignment: 0, sent: 0, in_progress: 0, completed: 0, cancelled: 0, total: 0 });
+    }
+    const rb = routeBreakdown.get(routeKey)!;
+    rb[s] = (rb[s] || 0) + 1;
+    rb.total++;
+
+    const cty = pkt.county || 'Unknown';
+    if (!countyBreakdown.has(cty)) countyBreakdown.set(cty, { count: 0, completed: 0 });
+    const cb = countyBreakdown.get(cty)!;
+    cb.count++;
+    if (s === 'completed') cb.completed++;
+  }
+
+  return c.json({
+    kpis: {
+      totalPackets: packets.length,
+      needsAssignment, inProgress, completed,
+      avgCompletionHours: completionCount > 0
+        ? Math.round((totalCompletionMs / completionCount / (1000 * 60 * 60)) * 10) / 10
+        : null,
+    },
+    statusDistribution: Object.entries(statusCounts)
       .filter(([, count]) => count > 0)
-      .map(([status, count]) => ({
-        status,
-        count,
-        label: statusLabels[status] || status,
-      }));
-
-    const completionTrend = Array.from(trendMap.entries()).map(([date, data]) => ({
-      date,
-      created: data.created,
-      completed: data.completed,
-    }));
-
-    const byFormRoute = Array.from(routeBreakdown.entries())
+      .map(([status, count]) => ({ status, count, label: statusLabels[status] || status })),
+    completionTrend: Array.from(trendMap.entries()).map(([date, data]) => ({ date, ...data })),
+    byFormRoute: Array.from(routeBreakdown.entries())
       .map(([routeId, counts]) => ({
         formRouteId: routeId,
         formName: routeId ? (routeMap.get(routeId) || 'Unknown Route') : 'Manual Upload',
         ...counts,
       }))
-      .sort((a, b) => (b as any).total - (a as any).total);
-
-    const byCounty = Array.from(countyBreakdown.entries())
-      .map(([cty, data]) => ({
-        county: cty,
-        count: data.count,
-        completed: data.completed,
-      }))
-      .sort((a, b) => b.count - a.count);
-
-    const needsAttentionWithFormName = needsAttention.map(pkt => ({
+      .sort((a, b) => (b as any).total - (a as any).total),
+    byCounty: Array.from(countyBreakdown.entries())
+      .map(([cty, data]) => ({ county: cty, ...data }))
+      .sort((a, b) => b.count - a.count),
+    needsAttention: needsAttention.map(pkt => ({
       ...pkt,
       formName: pkt.formRouteId ? (routeMap.get(pkt.formRouteId) || null) : null,
-    }));
-
-    return {
-      kpis: {
-        totalPackets: packets.length,
-        needsAssignment,
-        inProgress,
-        completed,
-        avgCompletionHours: completionCount > 0
-          ? Math.round((totalCompletionMs / completionCount / (1000 * 60 * 60)) * 10) / 10
-          : null,
-      },
-      statusDistribution,
-      completionTrend,
-      byFormRoute,
-      byCounty,
-      needsAttention: needsAttentionWithFormName,
-      recentActivity,
-      filterOptions: {
-        formRoutes: formRoutes.map(r => ({ id: r.id, formName: r.formName })),
-        counties: distinctCounties.map(c => c.county).filter(Boolean) as string[],
-      },
-    };
+    })),
+    recentActivity,
+    filterOptions: {
+      formRoutes: formRouteList.map(r => ({ id: r.id, formName: r.formName })),
+      counties: distinctCounties.map(c => c.county).filter(Boolean) as string[],
+    },
   });
+});
 
-  // Preview original PDF (inline)
-  fastify.get<{ Params: { packetId: string } }>(
-    '/packets/:packetId/preview',
-    async (request, reply) => {
-      const { packetId } = request.params;
+// Preview original PDF
+adminRoutes.get('/packets/:packetId/preview', async (c) => {
+  const packet = await db.query.signingPackets.findFirst({
+    where: eq(signingPackets.id, c.req.param('packetId')),
+  });
+  if (!packet) return c.json({ error: 'Packet not found' }, 404);
 
-      const packet = await prisma.signingPacket.findUnique({
-        where: { id: packetId },
-      });
+  try {
+    const pdfBuffer = await downloadFile(packet.filePath);
+    return new Response(pdfBuffer, {
+      headers: { 'Content-Type': 'application/pdf', 'Content-Disposition': 'inline' },
+    });
+  } catch {
+    return c.json({ error: 'PDF file not found' }, 404);
+  }
+});
 
-      if (!packet) {
-        return reply.status(404).send({ error: 'Packet not found' });
-      }
+// Download signed PDF
+adminRoutes.get('/packets/:packetId/download', async (c) => {
+  const packet = await db.query.signingPackets.findFirst({
+    where: eq(signingPackets.id, c.req.param('packetId')),
+  });
+  if (!packet) return c.json({ error: 'Packet not found' }, 404);
 
-      try {
-        const filePath = path.join(process.cwd(), 'uploads', packet.filePath);
-        const pdfBuffer = await fs.readFile(filePath);
+  if (packet.status !== 'completed' || !packet.signedPdfPath) {
+    return c.json({ error: 'Signed PDF not available' }, 400);
+  }
 
-        return reply
-          .header('Content-Type', 'application/pdf')
-          .header('Content-Disposition', 'inline')
-          .send(pdfBuffer);
-      } catch (err) {
-        return reply.status(404).send({ error: 'PDF file not found' });
-      }
-    }
-  );
-
-  // Download signed PDF
-  fastify.get<{ Params: { packetId: string } }>(
-    '/packets/:packetId/download',
-    async (request, reply) => {
-      const { packetId } = request.params;
-
-      const packet = await prisma.signingPacket.findUnique({
-        where: { id: packetId },
-      });
-
-      if (!packet) {
-        return reply.status(404).send({ error: 'Packet not found' });
-      }
-
-      if (packet.status !== 'completed' || !packet.signedPdfPath) {
-        return reply.status(400).send({ error: 'Signed PDF not available' });
-      }
-
-      try {
-        const pdfBuffer = await fs.readFile(packet.signedPdfPath);
-        const fileName = `${packet.name.replace(/[^a-zA-Z0-9]/g, '_')}_signed.pdf`;
-
-        return reply
-          .header('Content-Type', 'application/pdf')
-          .header('Content-Disposition', `attachment; filename="${fileName}"`)
-          .send(pdfBuffer);
-      } catch (err) {
-        return reply.status(404).send({ error: 'PDF file not found' });
-      }
-    }
-  );
-
-  // Audit log search
-  fastify.get<{
-    Querystring: {
-      packetId?: string;
-      action?: string;
-      from?: string;
-      to?: string;
-      limit?: string;
-    };
-  }>('/audit-logs', async (request, reply) => {
-    const { packetId, action, from, to, limit = '100' } = request.query;
-
-    const logs = await prisma.auditLog.findMany({
-      where: {
-        ...(packetId && { packetId }),
-        ...(action && { action }),
-        ...(from && { createdAt: { gte: new Date(from) } }),
-        ...(to && { createdAt: { lte: new Date(to) } }),
-      },
-      orderBy: { createdAt: 'desc' },
-      take: parseInt(limit, 10),
-      include: {
-        packet: { select: { id: true, name: true } },
-        recipient: { select: { name: true, email: true, roleName: true } },
+  try {
+    const pdfBuffer = await downloadFile(packet.signedPdfPath);
+    const fileName = `${packet.name.replace(/[^a-zA-Z0-9]/g, '_')}_signed.pdf`;
+    return new Response(pdfBuffer, {
+      headers: {
+        'Content-Type': 'application/pdf',
+        'Content-Disposition': `attachment; filename="${fileName}"`,
       },
     });
+  } catch {
+    return c.json({ error: 'PDF file not found' }, 404);
+  }
+});
 
-    return logs;
+// Audit log search
+adminRoutes.get('/audit-logs', async (c) => {
+  const packetId = c.req.query('packetId');
+  const action = c.req.query('action');
+  const from = c.req.query('from');
+  const to = c.req.query('to');
+  const limit = c.req.query('limit') || '100';
+
+  const conditions = [];
+  if (packetId) conditions.push(eq(auditLogs.packetId, packetId));
+  if (action) conditions.push(eq(auditLogs.action, action));
+  if (from) conditions.push(gte(auditLogs.createdAt, new Date(from)));
+  if (to) conditions.push(lte(auditLogs.createdAt, new Date(to)));
+
+  const logs = await db.query.auditLogs.findMany({
+    where: conditions.length > 0 ? and(...conditions) : undefined,
+    orderBy: (a, { desc }) => [desc(a.createdAt)],
+    limit: parseInt(limit, 10),
+    with: {
+      packet: { columns: { id: true, name: true } },
+      recipient: { columns: { name: true, email: true, roleName: true } },
+    },
   });
 
-  // Recipient details with signature info
-  fastify.get<{ Params: { recipientId: string } }>(
-    '/recipients/:recipientId',
-    async (request, reply) => {
-      const { recipientId } = request.params;
+  return c.json(logs);
+});
 
-      const recipient = await prisma.recipient.findUnique({
-        where: { id: recipientId },
-        include: {
-          packet: {
-            select: { id: true, name: true, status: true },
-          },
-          signature: {
-            select: {
-              id: true,
-              signatureType: true,
-              typedName: true,
-              ipAddress: true,
-              userAgent: true,
-              createdAt: true,
-            },
-          },
-          auditLogs: {
-            orderBy: { createdAt: 'desc' },
-          },
-        },
+// Recipient details
+adminRoutes.get('/recipients/:recipientId', async (c) => {
+  const recipient = await db.query.recipients.findFirst({
+    where: eq(recipients.id, c.req.param('recipientId')),
+    with: {
+      packet: { columns: { id: true, name: true, status: true } },
+      signature: {
+        columns: { id: true, signatureType: true, typedName: true, ipAddress: true, userAgent: true, createdAt: true },
+      },
+      auditLogs: {
+        orderBy: (a, { desc }) => [desc(a.createdAt)],
+      },
+    },
+  });
+
+  if (!recipient) return c.json({ error: 'Recipient not found' }, 404);
+  return c.json(recipient);
+});
+
+// --- SharePoint Admin Routes ---
+
+adminRoutes.get('/sharepoint/status', async (c) => {
+  const configured = isSharePointConfigured();
+  if (!configured) {
+    return c.json({
+      configured: false, connected: false,
+      message: 'SharePoint integration is not configured. Set SHAREPOINT_ENABLED=true and provide Microsoft credentials.',
+    });
+  }
+
+  try {
+    const connectionTest = await testSharePointConnection();
+    return c.json({ configured: true, ...connectionTest });
+  } catch (err) {
+    return c.json({ configured: true, connected: false, error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
+adminRoutes.post('/sharepoint/retry/:packetId', async (c) => {
+  if (!isSharePointConfigured()) {
+    return c.json({ error: 'SharePoint integration is not configured' }, 400);
+  }
+
+  const packet = await db.query.signingPackets.findFirst({
+    where: eq(signingPackets.id, c.req.param('packetId')),
+  });
+  if (!packet) return c.json({ error: 'Packet not found' }, 404);
+
+  if (packet.status !== 'completed' || !packet.signedPdfPath) {
+    return c.json({ error: 'Packet must be completed with a signed PDF' }, 400);
+  }
+
+  if (packet.sharepointUrl) {
+    return c.json({ error: 'Already uploaded to SharePoint', url: packet.sharepointUrl }, 400);
+  }
+
+  try {
+    const pdfBuffer = await downloadFile(packet.signedPdfPath);
+    const employeeName = packet.employeeName || packet.name;
+    const signedFileName = `${packet.name.replace(/[^a-zA-Z0-9]/g, '_')}_signed.pdf`;
+
+    let subfolder: string | null = null;
+    if (packet.formRouteId) {
+      const formRoute = await db.query.formRoutes.findFirst({
+        where: eq(formRoutes.id, packet.formRouteId),
       });
+      subfolder = formRoute?.sharepointFolder || null;
+    }
 
-      if (!recipient) {
-        return reply.status(404).send({ error: 'Recipient not found' });
+    const uploadResult = await uploadToSharePoint(employeeName, signedFileName, pdfBuffer, subfolder);
+
+    await db.update(signingPackets)
+      .set({ sharepointUrl: uploadResult.url, sharepointFolder: uploadResult.folderName, sharepointError: null })
+      .where(eq(signingPackets.id, packet.id));
+
+    const matchInfo = uploadResult.isExistingFolder
+      ? `matched existing folder "${uploadResult.folderName}" (${Math.round(uploadResult.matchConfidence * 100)}% confidence)`
+      : `created new folder "${uploadResult.folderName}"`;
+
+    await db.insert(auditLogs).values({
+      packetId: packet.id, action: 'uploaded', details: `Retry: Signed PDF uploaded to SharePoint: ${uploadResult.url} — ${matchInfo}`,
+    });
+
+    return c.json({ success: true, url: uploadResult.url, folderName: uploadResult.folderName, matchInfo });
+  } catch (err) {
+    const errorMsg = err instanceof Error ? err.message : String(err);
+    await db.update(signingPackets).set({ sharepointError: errorMsg }).where(eq(signingPackets.id, packet.id)).catch(() => {});
+    await db.insert(auditLogs).values({
+      packetId: packet.id, action: 'upload_failed', details: `Retry failed: ${errorMsg}`,
+    }).catch(() => {});
+    return c.json({ error: `SharePoint upload failed: ${errorMsg}` }, 500);
+  }
+});
+
+adminRoutes.post('/sharepoint/retry-all', async (c) => {
+  if (!isSharePointConfigured()) {
+    return c.json({ error: 'SharePoint integration is not configured' }, 400);
+  }
+
+  const failedPackets = await db.query.signingPackets.findMany({
+    where: and(
+      eq(signingPackets.status, 'completed'),
+      isNotNull(signingPackets.signedPdfPath),
+      sql`${signingPackets.sharepointUrl} IS NULL`
+    ),
+    columns: { id: true, name: true },
+  });
+
+  if (failedPackets.length === 0) {
+    return c.json({ success: true, retried: 0, message: 'No failed uploads to retry' });
+  }
+
+  let succeeded = 0, failed = 0;
+  const errors: string[] = [];
+
+  for (const pkt of failedPackets) {
+    try {
+      const packet = await db.query.signingPackets.findFirst({
+        where: eq(signingPackets.id, pkt.id),
+      });
+      if (!packet || !packet.signedPdfPath) continue;
+
+      const pdfBuffer = await downloadFile(packet.signedPdfPath);
+      const employeeName = packet.employeeName || packet.name;
+      const signedFileName = `${packet.name.replace(/[^a-zA-Z0-9]/g, '_')}_signed.pdf`;
+
+      let subfolder: string | null = null;
+      if (packet.formRouteId) {
+        const formRoute = await db.query.formRoutes.findFirst({
+          where: eq(formRoutes.id, packet.formRouteId),
+        });
+        subfolder = formRoute?.sharepointFolder || null;
       }
 
-      return recipient;
-    }
-  );
+      const uploadResult = await uploadToSharePoint(employeeName, signedFileName, pdfBuffer, subfolder);
 
-  // --- SharePoint Admin Routes ---
+      await db.update(signingPackets)
+        .set({ sharepointUrl: uploadResult.url, sharepointFolder: uploadResult.folderName, sharepointError: null })
+        .where(eq(signingPackets.id, packet.id));
 
-  // GET /sharepoint/status - Check SharePoint configuration and connection
-  fastify.get('/sharepoint/status', async (request, reply) => {
-    const configured = isSharePointConfigured();
+      await db.insert(auditLogs).values({
+        packetId: packet.id, action: 'uploaded', details: `Bulk retry: Uploaded to SharePoint: ${uploadResult.url}`,
+      });
 
-    if (!configured) {
-      return {
-        configured: false,
-        connected: false,
-        message: 'SharePoint integration is not configured. Set SHAREPOINT_ENABLED=true and provide Microsoft credentials.',
-      };
-    }
-
-    try {
-      const connectionTest = await testSharePointConnection();
-      return {
-        configured: true,
-        ...connectionTest,
-      };
+      succeeded++;
     } catch (err) {
-      return {
-        configured: true,
-        connected: false,
-        error: err instanceof Error ? err.message : String(err),
-      };
+      failed++;
+      errors.push(`${pkt.name}: ${err instanceof Error ? err.message : String(err)}`);
     }
+  }
+
+  return c.json({ success: true, total: failedPackets.length, succeeded, failed, errors });
+});
+
+adminRoutes.post('/sharepoint/refresh-cache', async (c) => {
+  if (!isSharePointConfigured()) {
+    return c.json({ error: 'SharePoint integration is not configured' }, 400);
+  }
+
+  try {
+    const body = await c.req.json().catch(() => ({}));
+    const subfolder = (body as any)?.subfolder || null;
+    const folderCount = await refreshFolderCache(subfolder);
+    return c.json({ success: true, folderCount });
+  } catch (err) {
+    return c.json({ error: `Failed to refresh cache: ${err instanceof Error ? err.message : String(err)}` }, 500);
+  }
+});
+
+adminRoutes.get('/sharepoint/failed', async (c) => {
+  const failedPackets = await db.query.signingPackets.findMany({
+    where: and(
+      eq(signingPackets.status, 'completed'),
+      isNotNull(signingPackets.signedPdfPath),
+      sql`${signingPackets.sharepointUrl} IS NULL`
+    ),
+    columns: { id: true, name: true, employeeName: true, sharepointError: true, completedAt: true, formRouteId: true },
+    orderBy: (t, { desc }) => [desc(t.completedAt)],
   });
+  return c.json({ count: failedPackets.length, packets: failedPackets });
+});
 
-  // POST /sharepoint/retry/:packetId - Retry a failed SharePoint upload
-  fastify.post<{ Params: { packetId: string } }>(
-    '/sharepoint/retry/:packetId',
-    async (request, reply) => {
-      if (!isSharePointConfigured()) {
-        return reply.status(400).send({ error: 'SharePoint integration is not configured' });
-      }
+// System health check
+adminRoutes.get('/health', async (c) => {
+  const dbCheck = await db.execute(sql`SELECT 1 as ok`);
 
-      const packet = await prisma.signingPacket.findUnique({
-        where: { id: request.params.packetId },
-      });
-
-      if (!packet) {
-        return reply.status(404).send({ error: 'Packet not found' });
-      }
-
-      if (packet.status !== 'completed' || !packet.signedPdfPath) {
-        return reply.status(400).send({ error: 'Packet must be completed with a signed PDF' });
-      }
-
-      if (packet.sharepointUrl) {
-        return reply.status(400).send({
-          error: 'Already uploaded to SharePoint',
-          url: packet.sharepointUrl,
-        });
-      }
-
-      try {
-        const pdfBuffer = await fs.readFile(packet.signedPdfPath);
-        const employeeName = packet.employeeName || packet.name;
-        const signedFileName = `${packet.name.replace(/[^a-zA-Z0-9]/g, '_')}_signed.pdf`;
-
-        // Get optional subfolder from form route
-        let subfolder: string | null = null;
-        if (packet.formRouteId) {
-          const formRoute = await prisma.formRoute.findUnique({
-            where: { id: packet.formRouteId },
-          });
-          subfolder = formRoute?.sharepointFolder || null;
-        }
-
-        const uploadResult = await uploadToSharePoint(
-          employeeName,
-          signedFileName,
-          pdfBuffer,
-          subfolder
-        );
-
-        await prisma.signingPacket.update({
-          where: { id: packet.id },
-          data: {
-            sharepointUrl: uploadResult.url,
-            sharepointFolder: uploadResult.folderName,
-            sharepointError: null,
-          },
-        });
-
-        const matchInfo = uploadResult.isExistingFolder
-          ? `matched existing folder "${uploadResult.folderName}" (${Math.round(uploadResult.matchConfidence * 100)}% confidence)`
-          : `created new folder "${uploadResult.folderName}"`;
-
-        await prisma.auditLog.create({
-          data: {
-            packetId: packet.id,
-            action: 'uploaded',
-            details: `Retry: Signed PDF uploaded to SharePoint: ${uploadResult.url} — ${matchInfo}`,
-          },
-        });
-
-        return {
-          success: true,
-          url: uploadResult.url,
-          folderName: uploadResult.folderName,
-          matchInfo,
-        };
-      } catch (err) {
-        const errorMsg = err instanceof Error ? err.message : String(err);
-
-        await prisma.signingPacket.update({
-          where: { id: packet.id },
-          data: { sharepointError: errorMsg },
-        }).catch(() => {});
-
-        await prisma.auditLog.create({
-          data: {
-            packetId: packet.id,
-            action: 'upload_failed',
-            details: `Retry failed: ${errorMsg}`,
-          },
-        }).catch(() => {});
-
-        return reply.status(500).send({ error: `SharePoint upload failed: ${errorMsg}` });
-      }
-    }
-  );
-
-  // POST /sharepoint/retry-all - Retry all failed SharePoint uploads
-  fastify.post('/sharepoint/retry-all', async (request, reply) => {
-    if (!isSharePointConfigured()) {
-      return reply.status(400).send({ error: 'SharePoint integration is not configured' });
-    }
-
-    const failedPackets = await prisma.signingPacket.findMany({
-      where: {
-        status: 'completed',
-        signedPdfPath: { not: null },
-        sharepointUrl: null,
-      },
-      select: { id: true, name: true },
-    });
-
-    if (failedPackets.length === 0) {
-      return { success: true, retried: 0, message: 'No failed uploads to retry' };
-    }
-
-    let succeeded = 0;
-    let failed = 0;
-    const errors: string[] = [];
-
-    for (const pkt of failedPackets) {
-      try {
-        // Call the retry route logic inline
-        const packet = await prisma.signingPacket.findUnique({ where: { id: pkt.id } });
-        if (!packet || !packet.signedPdfPath) continue;
-
-        const pdfBuffer = await fs.readFile(packet.signedPdfPath);
-        const employeeName = packet.employeeName || packet.name;
-        const signedFileName = `${packet.name.replace(/[^a-zA-Z0-9]/g, '_')}_signed.pdf`;
-
-        let subfolder: string | null = null;
-        if (packet.formRouteId) {
-          const formRoute = await prisma.formRoute.findUnique({ where: { id: packet.formRouteId } });
-          subfolder = formRoute?.sharepointFolder || null;
-        }
-
-        const uploadResult = await uploadToSharePoint(employeeName, signedFileName, pdfBuffer, subfolder);
-
-        await prisma.signingPacket.update({
-          where: { id: packet.id },
-          data: {
-            sharepointUrl: uploadResult.url,
-            sharepointFolder: uploadResult.folderName,
-            sharepointError: null,
-          },
-        });
-
-        await prisma.auditLog.create({
-          data: {
-            packetId: packet.id,
-            action: 'uploaded',
-            details: `Bulk retry: Uploaded to SharePoint: ${uploadResult.url}`,
-          },
-        });
-
-        succeeded++;
-      } catch (err) {
-        failed++;
-        errors.push(`${pkt.name}: ${err instanceof Error ? err.message : String(err)}`);
-      }
-    }
-
-    return { success: true, total: failedPackets.length, succeeded, failed, errors };
+  return c.json({
+    status: 'ok',
+    database: !!dbCheck,
+    storage: { type: 'object-storage' },
+    timestamp: new Date().toISOString(),
   });
-
-  // POST /sharepoint/refresh-cache - Force refresh the folder cache
-  fastify.post<{ Body: { subfolder?: string } }>(
-    '/sharepoint/refresh-cache',
-    async (request, reply) => {
-      if (!isSharePointConfigured()) {
-        return reply.status(400).send({ error: 'SharePoint integration is not configured' });
-      }
-
-      try {
-        const subfolder = (request.body as any)?.subfolder || null;
-        const folderCount = await refreshFolderCache(subfolder);
-        return { success: true, folderCount };
-      } catch (err) {
-        return reply.status(500).send({
-          error: `Failed to refresh cache: ${err instanceof Error ? err.message : String(err)}`,
-        });
-      }
-    }
-  );
-
-  // GET /sharepoint/failed - List packets with failed SharePoint uploads
-  fastify.get('/sharepoint/failed', async () => {
-    const failedPackets = await prisma.signingPacket.findMany({
-      where: {
-        status: 'completed',
-        signedPdfPath: { not: null },
-        sharepointUrl: null,
-      },
-      select: {
-        id: true,
-        name: true,
-        employeeName: true,
-        sharepointError: true,
-        completedAt: true,
-        formRouteId: true,
-      },
-      orderBy: { completedAt: 'desc' },
-    });
-
-    return { count: failedPackets.length, packets: failedPackets };
-  });
-
-  // System health check
-  fastify.get('/health', async (request, reply) => {
-    const dbCheck = await prisma.$queryRaw`SELECT 1 as ok`;
-
-    const uploadsDir = path.join(process.cwd(), 'uploads');
-    const signedDir = path.join(process.cwd(), 'signed');
-
-    let uploadsWritable = false;
-    let signedWritable = false;
-
-    try {
-      await fs.access(uploadsDir, fs.constants.W_OK);
-      uploadsWritable = true;
-    } catch {}
-
-    try {
-      await fs.access(signedDir, fs.constants.W_OK);
-      signedWritable = true;
-    } catch {}
-
-    return {
-      status: 'ok',
-      database: !!dbCheck,
-      storage: {
-        uploads: uploadsWritable,
-        signed: signedWritable,
-      },
-      timestamp: new Date().toISOString(),
-    };
-  });
-};
+});
