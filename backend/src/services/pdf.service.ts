@@ -1008,12 +1008,87 @@ export async function stampSignatureFromBuffer(
 
   console.log('[PDF] Value map:', Object.fromEntries(valueMap));
 
-  // Step 1: Replace tags with values IN-PLACE
+  // Step 1: Replace tags with values IN-PLACE (text replacement in streams)
   console.log('[PDF] Replacing tags with values in-place...');
   const modifiedPdfBytes = await replaceTagsWithValues(originalPdfBytes, valueMap);
 
-  // Step 2: Load the modified PDF (no footer added - just save it)
+  // Step 2: Load the modified PDF with pdf-lib for image embedding
   const pdfDoc = await PDFDocument.load(modifiedPdfBytes);
+
+  // Step 3: Embed signature IMAGES for drawn signatures on the correct pages
+  for (const stamp of stamps) {
+    if (stamp.signatureData.signatureType === 'drawn' && stamp.signatureData.signatureImage) {
+      console.log(`[PDF] Embedding signature image for role: ${stamp.role}`);
+
+      // Find SIGNATURE placeholders that match this signer's role
+      const sigPlaceholders = placeholders.filter(p =>
+        p.type === 'SIGNATURE' &&
+        (p.role === stamp.role || p.role === 'signer' || p.role === 'signer1' ||
+         stamp.role.startsWith(p.role) || p.role.startsWith(stamp.role))
+      );
+
+      if (sigPlaceholders.length === 0) {
+        console.log(`[PDF] No SIGNATURE placeholders found for role: ${stamp.role}`);
+        continue;
+      }
+
+      // Parse the base64 image data
+      const base64Data = stamp.signatureData.signatureImage.replace(/^data:image\/\w+;base64,/, '');
+      const imageBytes = Buffer.from(base64Data, 'base64');
+
+      // Try to embed as PNG first (SignaturePad produces PNGs), then JPG
+      let image;
+      try {
+        image = await pdfDoc.embedPng(imageBytes);
+        console.log(`[PDF] Embedded PNG signature image: ${image.width}x${image.height}`);
+      } catch {
+        try {
+          image = await pdfDoc.embedJpg(imageBytes);
+          console.log(`[PDF] Embedded JPG signature image: ${image.width}x${image.height}`);
+        } catch (imgErr) {
+          console.error('[PDF] Could not embed signature image:', imgErr);
+          continue; // text replacement already handled it
+        }
+      }
+
+      // Draw the signature image on each matching placeholder location
+      for (const p of sigPlaceholders) {
+        const pageIndex = p.pageNumber - 1; // pdf-lib uses 0-based page index
+        if (pageIndex < 0 || pageIndex >= pdfDoc.getPageCount()) {
+          console.warn(`[PDF] Skipping signature on invalid page ${p.pageNumber}`);
+          continue;
+        }
+
+        const page = pdfDoc.getPage(pageIndex);
+
+        // Scale image to fit the placeholder area while maintaining aspect ratio
+        const imgAspect = image.width / image.height;
+        const boxAspect = p.width / p.height;
+        let drawW = p.width;
+        let drawH = p.height;
+        let drawX = p.x;
+        let drawY = p.y; // PDF y-coordinate (bottom of field from page bottom)
+
+        if (imgAspect > boxAspect) {
+          // Image is wider than box — fit to width, center vertically
+          drawH = p.width / imgAspect;
+          drawY += (p.height - drawH) / 2;
+        } else {
+          // Image is taller — fit to height, center horizontally
+          drawW = p.height * imgAspect;
+          drawX += (p.width - drawW) / 2;
+        }
+
+        console.log(`[PDF] Drawing signature on page ${p.pageNumber} at (${drawX.toFixed(1)}, ${drawY.toFixed(1)}) ${drawW.toFixed(1)}x${drawH.toFixed(1)}`);
+        page.drawImage(image, {
+          x: drawX,
+          y: drawY,
+          width: drawW,
+          height: drawH,
+        });
+      }
+    }
+  }
 
   console.log('[PDF] Stamping complete');
 
