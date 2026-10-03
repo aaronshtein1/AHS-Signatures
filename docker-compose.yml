@@ -44,9 +44,6 @@ services:
     depends_on:
       db:
         condition: service_healthy
-    volumes:
-      - backend-uploads:/app/uploads
-      - backend-signed:/app/signed
     restart: unless-stopped
 
   frontend:
@@ -65,5 +62,3 @@ services:
 
 volumes:
   db-data:
-  backend-uploads:
-  backend-signed:

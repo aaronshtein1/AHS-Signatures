@@ -180,6 +180,17 @@ const TABLES: Table[] = [
   },
 ];
 
+TABLES.push({
+  name: 'StoredFile',
+  columns: [
+    ['key', 'TEXT PRIMARY KEY'],
+    ['data', 'BYTEA NOT NULL'],
+    ['contentType', "TEXT NOT NULL DEFAULT 'application/pdf'"],
+    ['size', 'INTEGER NOT NULL DEFAULT 0'],
+    ['createdAt', `${TS} NOT NULL DEFAULT CURRENT_TIMESTAMP`],
+  ],
+});
+
 const FOREIGN_KEYS: Array<{ name: string; table: string; sql: string }> = [
   {
     name: 'Recipient_packetId_fkey', table: 'Recipient',

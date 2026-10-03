@@ -1,76 +1,45 @@
-import { S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand } from '@aws-sdk/client-s3';
-import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import fs from 'fs/promises';
 import path from 'path';
+import { db, storedFiles, eq } from '../db/index.js';
 
-const BUCKET = process.env.AWS_S3_BUCKET || 'documents';
-const USE_LOCAL = !process.env.AWS_ACCESS_KEY_ID;
-const LOCAL_ROOT = path.join(process.cwd(), 'uploads');
+/**
+ * Document storage in PostgreSQL (table "StoredFile"), so originals and signed
+ * PDFs live in the same Railway database as everything else and survive
+ * redeploys. Keys look like "packets/<id>/<file>.pdf" or "signed/<file>.pdf".
+ */
 
-let _s3: S3Client | null = null;
-
-function getS3(): S3Client {
-  if (!_s3) {
-    _s3 = new S3Client({
-      region: process.env.AWS_REGION || 'auto',
-      endpoint: process.env.AWS_ENDPOINT_URL_S3,
-      credentials: {
-        accessKeyId: process.env.AWS_ACCESS_KEY_ID!,
-        secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY!,
-      },
-      forcePathStyle: true,
-    });
-  }
-  return _s3;
-}
+// Files written by older versions to the container disk (read-only fallback)
+const LEGACY_ROOT = path.join(process.cwd(), 'uploads');
 
 export async function uploadFile(key: string, buffer: Buffer | Uint8Array, contentType = 'application/pdf'): Promise<void> {
-  if (USE_LOCAL) {
-    const fullPath = path.join(LOCAL_ROOT, key);
-    await fs.mkdir(path.dirname(fullPath), { recursive: true });
-    await fs.writeFile(fullPath, buffer);
-    return;
-  }
-  await getS3().send(new PutObjectCommand({
-    Bucket: BUCKET,
-    Key: key,
-    Body: buffer,
-    ContentType: contentType,
-  }));
+  const data = Buffer.from(buffer);
+  await db.insert(storedFiles)
+    .values({ key, data, contentType, size: data.length })
+    .onConflictDoUpdate({
+      target: storedFiles.key,
+      set: { data, contentType, size: data.length, createdAt: new Date() },
+    });
 }
 
 export async function downloadFile(key: string): Promise<Buffer> {
-  if (USE_LOCAL) {
-    const fullPath = path.join(LOCAL_ROOT, key);
-    return fs.readFile(fullPath);
+  const row = await db.query.storedFiles.findFirst({ where: eq(storedFiles.key, key) });
+  if (row) return row.data;
+
+  // Older deployments kept files on disk; move them into the database on first read
+  const legacyPath = path.join(LEGACY_ROOT, key);
+  if (!path.resolve(legacyPath).startsWith(path.resolve(LEGACY_ROOT) + path.sep)) {
+    throw new Error(`File not found: ${key}`);
   }
-  const result = await getS3().send(new GetObjectCommand({
-    Bucket: BUCKET,
-    Key: key,
-  }));
-  const bytes = await result.Body!.transformToByteArray();
-  return Buffer.from(bytes);
+  try {
+    const data = await fs.readFile(legacyPath);
+    await uploadFile(key, data).catch(err => console.error(`[Storage] Could not import ${key}:`, err));
+    return data;
+  } catch {
+    throw new Error(`File not found: ${key}`);
+  }
 }
 
 export async function deleteFile(key: string): Promise<void> {
-  if (USE_LOCAL) {
-    const fullPath = path.join(LOCAL_ROOT, key);
-    await fs.unlink(fullPath).catch(() => {});
-    return;
-  }
-  await getS3().send(new DeleteObjectCommand({
-    Bucket: BUCKET,
-    Key: key,
-  }));
-}
-
-export async function getFileUrl(key: string, expiresIn = 3600): Promise<string> {
-  if (USE_LOCAL) {
-    return `file://${path.join(LOCAL_ROOT, key)}`;
-  }
-  const url = await getSignedUrl(getS3(), new GetObjectCommand({
-    Bucket: BUCKET,
-    Key: key,
-  }), { expiresIn });
-  return url;
+  await db.delete(storedFiles).where(eq(storedFiles.key, key));
+  await fs.unlink(path.join(LEGACY_ROOT, key)).catch(() => {});
 }

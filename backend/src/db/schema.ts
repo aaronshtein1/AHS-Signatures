@@ -1,5 +1,5 @@
 import { randomUUID } from 'crypto';
-import { pgTable, text, boolean, timestamp, integer, index } from 'drizzle-orm/pg-core';
+import { pgTable, text, boolean, timestamp, integer, index, customType } from 'drizzle-orm/pg-core';
 import { relations, sql } from 'drizzle-orm';
 
 // ─── Users ───────────────────────────────────────────────────────
@@ -164,3 +164,16 @@ export const auditLogRelations = relations(auditLogs, ({ one }) => ({
     references: [recipients.id],
   }),
 }));
+
+// ─── Stored Files (PDF originals and signed copies) ─────────────
+const bytea = customType<{ data: Buffer; driverData: Buffer }>({
+  dataType: () => 'bytea',
+});
+
+export const storedFiles = pgTable('StoredFile', {
+  key: text('key').primaryKey(),
+  data: bytea('data').notNull(),
+  contentType: text('contentType').default('application/pdf').notNull(),
+  size: integer('size').notNull(),
+  createdAt: timestamp('createdAt', { precision: 3, mode: 'date' }).defaultNow().notNull(),
+});

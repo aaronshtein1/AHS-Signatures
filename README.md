@@ -149,10 +149,15 @@ See `backend/.env.example` for all available options.
 - `JWT_SECRET`: long random value (the default is public and lets anyone forge logins)
 - `ADMIN_SEED_EMAIL` / `ADMIN_SEED_PASSWORD`: initial admin account (only needed once)
 - `FRONTEND_URL`, `CORS_ORIGIN`, `API_BASE_URL`: public URLs
-- `AWS_*`: S3-compatible bucket for documents (otherwise files are kept on the container disk)
 - `EMAIL_*` / `SMTP_*`: Email provider configuration
 
-### Deployment
+### Deployment (Railway)
+
+Two Railway services (backend from `backend/`, frontend from `frontend/`) plus a Railway
+PostgreSQL database; set the backend's `DATABASE_URL` to the database's connection string.
+All documents (uploaded originals and signed PDFs) are stored in PostgreSQL (`StoredFile`
+table), so no separate file storage or volume is needed and they are covered by the
+database's backups.
 
 The backend Docker image runs, on every start: `node dist/db/migrate.js` (creates missing
 tables/columns/indexes, never drops anything — safe on an existing database), then
