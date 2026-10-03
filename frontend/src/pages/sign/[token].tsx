@@ -107,15 +107,12 @@ export default function SigningPage() {
       setSession(data);
       setTypedName(data.recipient.name);
 
+      // Only free-text fields are typed by the signer; dates, name, email and
+      // initials are filled in automatically when the document is stamped.
       const initial: Record<string, string> = {};
-      const placeholders = data.placeholders || [];
-      placeholders.filter((p: Placeholder) => p.type === 'TEXT').forEach((p: Placeholder) => {
-        if (p.fieldName) initial[p.fieldName] = '';
-      });
-      placeholders.filter((p: Placeholder) => p.type === 'DATE').forEach((p: Placeholder, idx: number) => {
-        const key = p.fieldName || `date_${idx}`;
-        initial[key] = new Date().toLocaleDateString('en-US');
-      });
+      (data.placeholders || [])
+        .filter((p: Placeholder) => p.type === 'TEXT' && !p.autoFill && p.fieldName)
+        .forEach((p: Placeholder) => { initial[p.fieldName!] = ''; });
       setTextFields(initial);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load signing session');
@@ -416,6 +413,12 @@ export default function SigningPage() {
                   setSigningStep(attestationAcknowledged ? 1 : 0);
                   setSigModalOpen(true);
                 }}
+                autoFillValues={{
+                  name: typedName,
+                  email: session.recipient.email,
+                  initials: typedName.split(/\s+/).filter(Boolean).map((w) => w[0].toUpperCase()).join(''),
+                  date: new Date().toLocaleDateString('en-US', { month: '2-digit', day: '2-digit', year: 'numeric' }),
+                }}
               />
             </ErrorBoundary>
           </div>
@@ -582,7 +585,7 @@ export default function SigningPage() {
                       </div>
                       <div className="flex justify-between text-sm items-center">
                         <span className="text-gray-500">Signature</span>
-                        {signatureType === 'drawn' && signatureData ? (
+                        {signatureData && signatureData.startsWith('data:image') ? (
                           <img src={signatureData} alt="Your signature" className="h-10 border border-gray-200 rounded bg-white px-2" />
                         ) : (
                           <span className="text-gray-900 italic" style={{ fontFamily: '"Dancing Script", cursive', fontSize: '1.1rem' }}>

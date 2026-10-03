@@ -65,15 +65,26 @@ npm run dev
 
 ## Template Placeholders
 
-Add these tags to your PDF templates where signatures should appear:
+Two tag styles are detected anywhere in the PDF text (including text inside Form XObjects,
+CID/Unicode fonts and text split across several drawing operators):
 
-| Tag | Description |
-|-----|-------------|
-| `[[SIGNATURE:roleName]]` | Signature field for the specified role |
-| `[[DATE:roleName]]` | Date field (auto-filled when signing) |
-| `[[TEXT:fieldName]]` | Text input field |
+**Adobe Sign text tags** — `{{[*]fieldName_es_:role[:type][:modifiers]}}`
 
-**Example roles**: employee, manager, contractor, witness
+| Example | Field |
+|---------|-------|
+| `{{Sig_es_:signer1:signature}}` | Signature |
+| `{{Dte1_es_:signer1:date}}` | Signing date (auto-filled, read-only) |
+| `{{Int_es_:signer1:initials}}` | Initials (auto-filled from the signer's name) |
+| `{{Name_es_:signer1:fullname}}` / `:email` | Signer name / email (auto-filled) |
+| `{{*Lic#_es_:signer1}}` | Free text typed by the signer |
+
+**Custom tags** — `[[SIGNATURE:role]]`, `[[DATE:role]]`, `[[TEXT:fieldName]]`
+
+**Which signer owns a tag:** a role that equals a recipient's role name goes to that recipient;
+otherwise `signer1`, `signer2`, ... go to the 1st, 2nd, ... recipient by signing order; a packet
+with a single recipient gets every tag. When the document is completed each tag is covered and
+replaced by its value. A signer whose signature has no tag in the document gets a signature page
+appended at the end. Dates use the `TIMEZONE` env var (default `America/New_York`).
 
 ### Creating a Template PDF
 

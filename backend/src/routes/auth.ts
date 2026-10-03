@@ -149,7 +149,8 @@ authRoutes.get('/microsoft/callback', async (c) => {
     }
 
     // Find or create user
-    let user = await authService.findUserByEmail(email);
+    let user: { id: string; role: string; isActive: boolean } | undefined =
+      await authService.findUserByEmail(email);
 
     if (!user) {
       // Auto-create with random password (SSO users won't use password login)

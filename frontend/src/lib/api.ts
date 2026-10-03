@@ -171,6 +171,9 @@ export const admin = {
   },
 
   // SharePoint
+  finalize: (packetId: string) =>
+    api<{ success: boolean; signedPdfPath: string; pdfHash: string }>(`/api/admin/packets/${packetId}/finalize`, { method: 'POST' }),
+
   sharepoint: {
     status: () => api<{
       configured: boolean;
@@ -268,10 +271,18 @@ export interface Placeholder {
   fieldName?: string;
   originalTag?: string;
   pageNumber: number;
+  /** Field box in PDF user space (origin bottom-left) */
   x: number;
   y: number;
   width: number;
   height: number;
+  tagBox?: { x: number; y: number; width: number; height: number };
+  fontSize?: number;
+  /** Filled automatically from the signer's identity / signing date */
+  autoFill?: 'name' | 'email' | 'initials' | 'date';
+  required?: boolean;
+  /** Page MediaBox [x0, y0, x1, y1] */
+  pageView?: [number, number, number, number];
 }
 
 export interface Recipient {

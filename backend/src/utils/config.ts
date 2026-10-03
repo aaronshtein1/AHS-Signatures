@@ -15,6 +15,9 @@ export const config = {
   FRONTEND_URL: process.env.FRONTEND_URL || 'http://localhost:3000',
   TOKEN_EXPIRY_HOURS: parseInt(process.env.TOKEN_EXPIRY_HOURS || '72', 10),
 
+  // Timezone used for dates stamped onto signed documents
+  TIMEZONE: process.env.TIMEZONE || 'America/New_York',
+
   // Email configuration
   EMAIL_PROVIDER: process.env.EMAIL_PROVIDER || 'smtp', // 'sendgrid' or 'smtp'
   SENDGRID_API_KEY: process.env.SENDGRID_API_KEY || '',

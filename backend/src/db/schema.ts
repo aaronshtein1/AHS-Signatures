@@ -1,9 +1,10 @@
+import { randomUUID } from 'crypto';
 import { pgTable, text, boolean, timestamp, integer, index } from 'drizzle-orm/pg-core';
 import { relations, sql } from 'drizzle-orm';
 
 // ─── Users ───────────────────────────────────────────────────────
 export const users = pgTable('User', {
-  id: text('id').primaryKey().default(sql`gen_random_uuid()`),
+  id: text('id').primaryKey().default(sql`gen_random_uuid()`).$defaultFn(() => randomUUID()),
   email: text('email').unique().notNull(),
   passwordHash: text('passwordHash').notNull(),
   name: text('name').notNull(),
@@ -18,7 +19,7 @@ export const users = pgTable('User', {
 
 // ─── Signing Packets ─────────────────────────────────────────────
 export const signingPackets = pgTable('SigningPacket', {
-  id: text('id').primaryKey().default(sql`gen_random_uuid()`),
+  id: text('id').primaryKey().default(sql`gen_random_uuid()`).$defaultFn(() => randomUUID()),
   name: text('name').notNull(),
   fileName: text('fileName').notNull(),
   filePath: text('filePath').notNull(),
@@ -45,7 +46,7 @@ export const signingPacketRelations = relations(signingPackets, ({ many }) => ({
 
 // ─── Recipients ──────────────────────────────────────────────────
 export const recipients = pgTable('Recipient', {
-  id: text('id').primaryKey().default(sql`gen_random_uuid()`),
+  id: text('id').primaryKey().default(sql`gen_random_uuid()`).$defaultFn(() => randomUUID()),
   packetId: text('packetId').notNull(),
   roleName: text('roleName').notNull(),
   name: text('name').notNull(),
@@ -70,7 +71,7 @@ export const recipientRelations = relations(recipients, ({ one, many }) => ({
 
 // ─── Signatures ──────────────────────────────────────────────────
 export const signatures = pgTable('Signature', {
-  id: text('id').primaryKey().default(sql`gen_random_uuid()`),
+  id: text('id').primaryKey().default(sql`gen_random_uuid()`).$defaultFn(() => randomUUID()),
   recipientId: text('recipientId').unique().notNull(),
   signatureData: text('signatureData').notNull(),
   signatureType: text('signatureType').notNull(),
@@ -92,7 +93,7 @@ export const signatureRelations = relations(signatures, ({ one }) => ({
 
 // ─── Form Routes ─────────────────────────────────────────────────
 export const formRoutes = pgTable('FormRoute', {
-  id: text('id').primaryKey().default(sql`gen_random_uuid()`),
+  id: text('id').primaryKey().default(sql`gen_random_uuid()`).$defaultFn(() => randomUUID()),
   jotformFormId: text('jotformFormId').unique().notNull(),
   formName: text('formName').notNull(),
   signerEmail: text('signerEmail'),
@@ -107,7 +108,7 @@ export const formRoutes = pgTable('FormRoute', {
 
 // ─── Processed Submissions ───────────────────────────────────────
 export const processedSubmissions = pgTable('ProcessedSubmission', {
-  id: text('id').primaryKey().default(sql`gen_random_uuid()`),
+  id: text('id').primaryKey().default(sql`gen_random_uuid()`).$defaultFn(() => randomUUID()),
   submissionId: text('submissionId').unique().notNull(),
   formId: text('formId').notNull(),
   packetId: text('packetId'),
@@ -127,7 +128,7 @@ export const systemSettings = pgTable('SystemSetting', {
 
 // ─── SharePoint Folder Cache ─────────────────────────────────────
 export const sharePointFolderCaches = pgTable('SharePointFolderCache', {
-  id: text('id').primaryKey().default(sql`gen_random_uuid()`),
+  id: text('id').primaryKey().default(sql`gen_random_uuid()`).$defaultFn(() => randomUUID()),
   folderId: text('folderId').notNull(),
   name: text('name').notNull(),
   webUrl: text('webUrl').default('').notNull(),
@@ -143,7 +144,7 @@ export const sharePointFolderCaches = pgTable('SharePointFolderCache', {
 
 // ─── Audit Logs ──────────────────────────────────────────────────
 export const auditLogs = pgTable('AuditLog', {
-  id: text('id').primaryKey().default(sql`gen_random_uuid()`),
+  id: text('id').primaryKey().default(sql`gen_random_uuid()`).$defaultFn(() => randomUUID()),
   packetId: text('packetId').notNull(),
   recipientId: text('recipientId'),
   action: text('action').notNull(),

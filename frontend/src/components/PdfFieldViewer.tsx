@@ -7,13 +7,10 @@ import { Placeholder } from '@/lib/api';
 // Use local worker copy (copied from node_modules/pdfjs-dist/build/ to public/)
 pdfjs.GlobalWorkerOptions.workerSrc = '/pdf.worker.min.mjs';
 
-// Default US Letter dimensions in PDF points
-const DEFAULT_DIMS = { width: 612, height: 792 };
+// Default US Letter MediaBox in PDF points
+const DEFAULT_VIEW: [number, number, number, number] = [0, 0, 612, 792];
 
-interface PageDims {
-  width: number;
-  height: number;
-}
+type View = [number, number, number, number];
 
 interface PdfFieldViewerProps {
   pdfUrl: string | null;
@@ -22,6 +19,8 @@ interface PdfFieldViewerProps {
   textFields: Record<string, string>;
   onTextFieldChange: (key: string, value: string) => void;
   onSignatureClick: () => void;
+  /** Values shown in auto-filled fields (name / email / initials / date) */
+  autoFillValues: Record<'name' | 'email' | 'initials' | 'date', string>;
 }
 
 export default function PdfFieldViewer({
@@ -31,25 +30,13 @@ export default function PdfFieldViewer({
   textFields,
   onTextFieldChange,
   onSignatureClick,
+  autoFillValues,
 }: PdfFieldViewerProps) {
   const [numPages, setNumPages] = useState(0);
-  const [pageDims, setPageDims] = useState<Record<number, PageDims>>({});
+  const [pageViews, setPageViews] = useState<Record<number, View>>({});
   const [containerWidth, setContainerWidth] = useState(700);
   const [pdfError, setPdfError] = useState<string | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
-
-  // Log placeholder info on mount/change
-  useEffect(() => {
-    if (placeholders.length > 0) {
-      const pages = Array.from(new Set(placeholders.map(p => p.pageNumber))).sort((a, b) => a - b);
-      console.log(`[PdfFieldViewer] ${placeholders.length} placeholders on pages: ${pages.join(', ')}`);
-      placeholders.forEach(p =>
-        console.log(`  ${p.type} "${p.fieldName || 'N/A'}" page=${p.pageNumber} x=${p.x.toFixed(1)} y=${p.y.toFixed(1)} w=${p.width} h=${p.height}`)
-      );
-    } else {
-      console.log('[PdfFieldViewer] No placeholders provided');
-    }
-  }, [placeholders]);
 
   // Measure container width
   useEffect(() => {
@@ -66,7 +53,6 @@ export default function PdfFieldViewer({
   }, []);
 
   const onDocumentLoadSuccess = useCallback(({ numPages: n }: { numPages: number }) => {
-    console.log(`[PdfFieldViewer] Document loaded: ${n} pages`);
     setNumPages(n);
     setPdfError(null);
   }, []);
@@ -77,53 +63,26 @@ export default function PdfFieldViewer({
   }, []);
 
   const onPageLoadSuccess = useCallback((page: any) => {
-    try {
-      // react-pdf v10 PageCallback has originalWidth/originalHeight via getViewport
-      // Fallback to view array [x1, y1, x2, y2] which gives the MediaBox
-      const w = page.originalWidth ?? page.width ?? (page.view ? page.view[2] - page.view[0] : DEFAULT_DIMS.width);
-      const h = page.originalHeight ?? page.height ?? (page.view ? page.view[3] - page.view[1] : DEFAULT_DIMS.height);
-      const pn = page.pageNumber ?? page._pageIndex + 1;
-      console.log(`[PdfFieldViewer] Page ${pn} loaded: ${w}x${h}`);
-      if (pn && w > 0 && h > 0) {
-        setPageDims((prev) => ({
-          ...prev,
-          [pn]: { width: w, height: h },
-        }));
-      }
-    } catch (err) {
-      console.error('[PdfFieldViewer] Error in onPageLoadSuccess:', err);
+    const pn = page.pageNumber ?? (page._pageIndex ?? 0) + 1;
+    const view = page.view as View | undefined;
+    if (pn && view && view[2] > view[0] && view[3] > view[1]) {
+      setPageViews((prev) => ({ ...prev, [pn]: view }));
     }
   }, []);
 
-  // Get dims for a page with fallback to default letter size
-  const getDims = (pageNum: number): PageDims => {
-    return pageDims[pageNum] || DEFAULT_DIMS;
-  };
-
-  // Compute overlay position for a placeholder (PDF coords → screen coords)
+  // Field placement: PDF user space (origin bottom-left of MediaBox) → CSS pixels
   const getFieldStyle = (p: Placeholder, pageNum: number): React.CSSProperties => {
-    const dims = getDims(pageNum);
-    const scale = containerWidth / dims.width;
-    const renderedH = dims.height * scale;
-
-    // PDF y-coordinate is from bottom; convert to top-based screen coordinate
-    // p.y is the text baseline (bottom of the field area in PDF coords)
-    let top = (dims.height - p.y) * scale - p.height * scale;
-    let left = p.x * scale;
-
-    // Clamp to keep within page bounds
-    if (top < 0) top = 0;
-    if (left < 0) left = 0;
-    if (top + p.height * scale > renderedH) top = renderedH - p.height * scale;
-    if (left + p.width * scale > containerWidth) left = containerWidth - p.width * scale;
-
+    const view = pageViews[pageNum] || p.pageView || DEFAULT_VIEW;
+    const pageW = view[2] - view[0];
+    const scale = containerWidth / pageW;
     return {
       position: 'absolute',
       zIndex: 10,
-      left,
-      top,
+      left: (p.x - view[0]) * scale,
+      top: (view[3] - (p.y + p.height)) * scale,
       width: p.width * scale,
       height: p.height * scale,
+      fontSize: Math.max(9, Math.min((p.fontSize || 10) * scale, 16)),
     };
   };
 
@@ -153,6 +112,8 @@ export default function PdfFieldViewer({
     );
   }
 
+  const isImage = !!signatureData && signatureData.startsWith('data:image');
+
   return (
     <div ref={containerRef}>
       <Document
@@ -180,7 +141,7 @@ export default function PdfFieldViewer({
           return (
             <div
               key={pageNum}
-              className="relative mb-6 shadow-lg mx-auto bg-white"
+              className="relative mb-6 shadow-lg mx-auto bg-white overflow-hidden"
               style={{ width: containerWidth }}
             >
               <Page
@@ -191,59 +152,59 @@ export default function PdfFieldViewer({
                 onLoadSuccess={onPageLoadSuccess}
               />
 
-              {/* Overlaid fields - render regardless of dims (use fallback) */}
               {pagePlaceholders.map((p, pIdx) => {
                 const style = getFieldStyle(p, pageNum);
+                const key = `${p.type}-${pageNum}-${pIdx}`;
 
-                // SIGNATURE placeholder
                 if (p.type === 'SIGNATURE') {
                   return (
                     <div
-                      key={`sig-${pageNum}-${pIdx}`}
+                      key={key}
                       style={style}
                       onClick={onSignatureClick}
-                      className="border-2 border-dashed border-blue-400 bg-blue-50/80 rounded cursor-pointer hover:bg-blue-100 hover:border-blue-500 transition-colors flex items-center justify-center"
+                      title="Click to sign"
+                      className={`border-2 border-dashed rounded cursor-pointer transition-colors flex items-center justify-center ${
+                        signatureData
+                          ? 'border-green-400 bg-white hover:bg-green-50'
+                          : 'border-blue-400 bg-blue-50 hover:bg-blue-100 hover:border-blue-500'
+                      }`}
                     >
-                      {signatureData ? (
-                        <span className="text-xs text-green-700 font-medium">
-                          ✓ Signed
-                        </span>
+                      {isImage ? (
+                        <img src={signatureData!} alt="Your signature" className="max-h-full max-w-full object-contain" />
                       ) : (
-                        <span className="text-xs text-blue-600 font-medium">
-                          Click to sign
-                        </span>
+                        <span className="text-xs text-blue-600 font-medium whitespace-nowrap">Click to sign</span>
                       )}
                     </div>
                   );
                 }
 
-                // DATE placeholder
-                if (p.type === 'DATE') {
-                  const fieldKey = p.fieldName || `date_${pIdx}`;
+                // Auto-filled fields (dates, name, email, initials) are shown read-only
+                const auto = p.autoFill || (p.type === 'DATE' ? 'date' : undefined);
+                if (auto) {
                   return (
-                    <input
-                      key={`date-${pageNum}-${pIdx}`}
-                      type="text"
-                      value={textFields[fieldKey] || ''}
-                      onChange={(e) => onTextFieldChange(fieldKey, e.target.value)}
+                    <div
+                      key={key}
                       style={style}
-                      className="border border-blue-300 bg-white/90 rounded text-xs px-1 focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none"
-                      placeholder="MM/DD/YYYY"
-                    />
+                      title="Filled in automatically when you sign"
+                      className="border border-gray-300 bg-gray-50 rounded px-1 flex items-center text-gray-700 whitespace-nowrap overflow-hidden"
+                    >
+                      {autoFillValues[auto]}
+                    </div>
                   );
                 }
 
-                // TEXT placeholder
                 if (p.type === 'TEXT' && p.fieldName) {
                   return (
                     <input
-                      key={`text-${pageNum}-${pIdx}`}
+                      key={key}
                       type="text"
                       value={textFields[p.fieldName] || ''}
                       onChange={(e) => onTextFieldChange(p.fieldName!, e.target.value)}
                       style={style}
-                      className="border border-blue-300 bg-white/90 rounded text-xs px-1 focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none"
-                      placeholder={p.fieldName.replace(/_/g, ' ')}
+                      className={`border bg-white rounded px-1 focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none ${
+                        p.required && !textFields[p.fieldName] ? 'border-red-400' : 'border-blue-300'
+                      }`}
+                      placeholder={p.fieldName.replace(/[_#]/g, ' ').trim()}
                     />
                   );
                 }
@@ -251,14 +212,12 @@ export default function PdfFieldViewer({
                 return null;
               })}
 
-              {/* Field count indicator for pages with fields */}
               {pagePlaceholders.length > 0 && (
                 <div className="absolute top-2 left-3 text-xs text-blue-700 bg-blue-100 border border-blue-300 px-2 py-0.5 rounded z-20">
-                  {pagePlaceholders.length} field{pagePlaceholders.length > 1 ? 's' : ''} to fill
+                  {pagePlaceholders.length} field{pagePlaceholders.length > 1 ? 's' : ''} on this page
                 </div>
               )}
 
-              {/* Page number */}
               <div className="absolute bottom-2 right-3 text-xs text-gray-400 bg-white/80 px-1.5 py-0.5 rounded z-20">
                 Page {pageNum} of {numPages}
               </div>

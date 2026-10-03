@@ -9,6 +9,56 @@ const SIGNATURE_FONTS = [
   { name: 'Homemade Apple', label: 'Handwritten' },
 ];
 
+/** Crop a canvas to the bounding box of its non-transparent pixels. */
+function trimCanvasToDataUrl(source: HTMLCanvasElement, padding = 8): string | null {
+  const ctx = source.getContext('2d');
+  if (!ctx) return null;
+  const { width, height } = source;
+  const data = ctx.getImageData(0, 0, width, height).data;
+  let minX = width, minY = height, maxX = -1, maxY = -1;
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      if (data[(y * width + x) * 4 + 3] > 10) {
+        if (x < minX) minX = x;
+        if (x > maxX) maxX = x;
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
+      }
+    }
+  }
+  if (maxX < 0) return null;
+  minX = Math.max(0, minX - padding);
+  minY = Math.max(0, minY - padding);
+  maxX = Math.min(width - 1, maxX + padding);
+  maxY = Math.min(height - 1, maxY + padding);
+  const out = document.createElement('canvas');
+  out.width = maxX - minX + 1;
+  out.height = maxY - minY + 1;
+  out.getContext('2d')!.drawImage(source, minX, minY, out.width, out.height, 0, 0, out.width, out.height);
+  return out.toDataURL('image/png');
+}
+
+/** Render a typed name in a signature font to a transparent, trimmed PNG. */
+async function renderTypedSignature(name: string, fontName: string): Promise<string | null> {
+  const fontSpec = `96px "${fontName}"`;
+  try {
+    await document.fonts.load(fontSpec, name);
+  } catch {
+    // Fall back to whatever font is available
+  }
+  const canvas = document.createElement('canvas');
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return null;
+  ctx.font = `${fontSpec}, cursive`;
+  canvas.width = Math.ceil(ctx.measureText(name).width) + 80;
+  canvas.height = 180;
+  ctx.font = `${fontSpec}, cursive`; // resizing resets context state
+  ctx.fillStyle = 'rgb(10, 10, 80)';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(name, 40, canvas.height / 2);
+  return trimCanvasToDataUrl(canvas);
+}
+
 interface SignaturePadProps {
   onSignatureChange: (data: string | null, type: 'drawn' | 'typed') => void;
   typedName: string;
@@ -24,17 +74,32 @@ export default function SignaturePad({
   const signaturePadRef = useRef<SignaturePadLib | null>(null);
   const onSignatureChangeRef = useRef(onSignatureChange);
   const [mode, setMode] = useState<'draw' | 'type'>('draw');
-  const [isInitialized, setIsInitialized] = useState(false);
   const [selectedFont, setSelectedFont] = useState(SIGNATURE_FONTS[0].name);
+  const typedRequest = useRef(0);
+
+  // Typed signatures are sent as an image so the signed PDF matches the chosen style
+  const emitTyped = useCallback(async (name: string, fontName: string) => {
+    const request = ++typedRequest.current;
+    if (!name.trim()) {
+      onSignatureChangeRef.current(null, 'typed');
+      return;
+    }
+    const dataUrl = await renderTypedSignature(name.trim(), fontName);
+    if (request === typedRequest.current) {
+      onSignatureChangeRef.current(dataUrl, 'typed');
+    }
+  }, []);
 
   // Keep callback ref updated
   useEffect(() => {
     onSignatureChangeRef.current = onSignatureChange;
   }, [onSignatureChange]);
 
-  // Initialize signature pad only once when in draw mode
+  // Create the signature pad while in draw mode; tear it down when leaving draw mode.
+  // (Depending only on `mode` matters: re-running on other state would destroy the pad
+  // mid-signature and lose the strokes.)
   useEffect(() => {
-    if (canvasRef.current && mode === 'draw' && !isInitialized) {
+    if (canvasRef.current && mode === 'draw') {
       const canvas = canvasRef.current;
 
       const rect = canvas.getBoundingClientRect();
@@ -49,7 +114,8 @@ export default function SignaturePad({
       }
 
       signaturePadRef.current = new SignaturePadLib(canvas, {
-        backgroundColor: 'rgb(255, 255, 255)',
+        // Transparent so the signature does not paint a white box over the document's lines
+        backgroundColor: 'rgba(0, 0, 0, 0)',
         penColor: 'rgb(10, 10, 80)',
         minWidth: 0.8,
         maxWidth: 3.2,
@@ -59,22 +125,19 @@ export default function SignaturePad({
 
       signaturePadRef.current.addEventListener('endStroke', () => {
         if (signaturePadRef.current && !signaturePadRef.current.isEmpty()) {
-          const dataUrl = signaturePadRef.current.toDataURL('image/png');
+          const dataUrl = canvasRef.current ? trimCanvasToDataUrl(canvasRef.current) : null;
           onSignatureChangeRef.current(dataUrl, 'drawn');
         }
       });
-
-      setIsInitialized(true);
 
       return () => {
         if (signaturePadRef.current) {
           signaturePadRef.current.off();
           signaturePadRef.current = null;
         }
-        setIsInitialized(false);
       };
     }
-  }, [mode, isInitialized]);
+  }, [mode]);
 
   // Handle window resize
   useEffect(() => {
@@ -112,31 +175,21 @@ export default function SignaturePad({
   const handleTypedNameChange = useCallback(
     (name: string) => {
       onTypedNameChange(name);
-      if (mode === 'type' && name.trim()) {
-        onSignatureChange(name, 'typed');
-      } else if (mode === 'type') {
-        onSignatureChange(null, 'typed');
-      }
+      if (mode === 'type') emitTyped(name, selectedFont);
     },
-    [mode, onSignatureChange, onTypedNameChange]
+    [mode, selectedFont, emitTyped, onTypedNameChange]
   );
 
   const switchMode = (newMode: 'draw' | 'type') => {
-    if (newMode === 'draw' && mode !== 'draw') {
-      setIsInitialized(false);
-    }
     setMode(newMode);
+    typedRequest.current++;
     onSignatureChange(null, newMode === 'draw' ? 'drawn' : 'typed');
-    if (newMode === 'type' && typedName.trim()) {
-      onSignatureChange(typedName, 'typed');
-    }
+    if (newMode === 'type') emitTyped(typedName, selectedFont);
   };
 
   const handleFontChange = (fontName: string) => {
     setSelectedFont(fontName);
-    if (mode === 'type' && typedName.trim()) {
-      onSignatureChange(typedName, 'typed');
-    }
+    if (mode === 'type') emitTyped(typedName, fontName);
   };
 
   return (
@@ -265,7 +318,7 @@ export default function SignaturePad({
         <input
           type="text"
           value={typedName}
-          onChange={(e) => onTypedNameChange(e.target.value)}
+          onChange={(e) => handleTypedNameChange(e.target.value)}
           placeholder="Enter your full legal name"
           className="input"
           required

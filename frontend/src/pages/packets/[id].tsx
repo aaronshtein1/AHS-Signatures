@@ -349,6 +349,27 @@ function PacketDetailContent() {
                   </p>
                 </div>
               )}
+              {/* All signed but the signed PDF was not generated (e.g. an error during stamping) */}
+              {packet.status !== 'completed' && packet.status !== 'cancelled' &&
+                packet.recipients.length > 0 && packet.recipients.every((r) => r.status === 'signed') && (
+                <div className="pt-3 border-t border-gray-100">
+                  <p className="text-gray-500 mb-1">Signed PDF</p>
+                  <p className="text-xs text-red-600">All signers are done but the signed PDF was not generated.</p>
+                  <button
+                    onClick={async () => {
+                      try {
+                        await admin.finalize(packet.id);
+                        loadPacket(packet.id);
+                      } catch (err) {
+                        alert(err instanceof Error ? err.message : 'Finalization failed');
+                      }
+                    }}
+                    className="mt-2 px-3 py-1 text-xs bg-blue-600 text-white rounded hover:bg-blue-700"
+                  >
+                    Generate Signed PDF
+                  </button>
+                </div>
+              )}
               {/* SharePoint Upload Status */}
               {packet.status === 'completed' && (packet.sharepointUrl || packet.sharepointError) && (
                 <div className="pt-3 border-t border-gray-100">

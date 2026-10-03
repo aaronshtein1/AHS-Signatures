@@ -1,5 +1,6 @@
 import { config } from '../utils/config.js';
 import { db, sharePointFolderCaches, eq, and, gte } from '../db/index.js';
+import { findBestFolderMatch } from './name-matching.js';
 
 // --- Types ---
 
@@ -15,11 +16,6 @@ interface SharePointFolder {
   childCount: number;
   path: string;
   parentFolder: string;
-}
-
-interface FolderMatch {
-  folder: SharePointFolder;
-  confidence: number;
 }
 
 export interface SharePointUploadResult {
@@ -218,11 +214,16 @@ async function resolveDriveId(): Promise<string> {
 
 // --- Folder Navigation ---
 
+/** Encode a drive path for Graph path addressing, keeping "/" as the separator. */
+function encodeDrivePath(p: string): string {
+  return p.split('/').filter(Boolean).map(encodeURIComponent).join('/');
+}
+
 async function listFoldersFromApi(folderPath: string): Promise<SharePointFolder[]> {
   const driveId = await resolveDriveId();
-  const encodedPath = encodeURIComponent(folderPath);
+  // No $filter: SharePoint document libraries reject filtering children on the folder facet
   let url: string | null =
-    `/drives/${driveId}/root:/${encodedPath}:/children?$filter=folder ne null`;
+    `/drives/${driveId}/root:/${encodeDrivePath(folderPath)}:/children?$select=id,name,webUrl,folder&$top=999`;
 
   const folders: SharePointFolder[] = [];
 
@@ -318,97 +319,14 @@ async function getEmployeeFolders(subfolder?: string | null): Promise<SharePoint
 
     return folders;
   } catch (err) {
-    console.warn(`[SharePoint] Could not list folders at "${searchPath}": ${err}`);
-    return [];
+    // A missing base folder just means nothing exists yet; any other failure must not
+    // silently fall through to "create a new folder" (that duplicates employee folders).
+    if (err instanceof SharePointError && err.statusCode === 404) {
+      console.warn(`[SharePoint] Folder "${searchPath}" does not exist yet`);
+      return [];
+    }
+    throw err;
   }
-}
-
-// --- Fuzzy Name Matching ---
-
-function normalizeName(name: string): string {
-  return name
-    .trim()
-    .toLowerCase()
-    .replace(/\s+/g, ' ')
-    .replace(/[^\w\s-]/g, '');
-}
-
-function sequenceMatchRatio(a: string, b: string): number {
-  if (a.length === 0 && b.length === 0) return 1.0;
-  if (a.length === 0 || b.length === 0) return 0.0;
-
-  const totalLength = a.length + b.length;
-
-  function countMatches(
-    aStart: number, aEnd: number,
-    bStart: number, bEnd: number
-  ): number {
-    let bestLen = 0;
-    let bestAStart = 0;
-    let bestBStart = 0;
-
-    for (let i = aStart; i < aEnd; i++) {
-      for (let j = bStart; j < bEnd; j++) {
-        let k = 0;
-        while (i + k < aEnd && j + k < bEnd && a[i + k] === b[j + k]) {
-          k++;
-        }
-        if (k > bestLen) {
-          bestLen = k;
-          bestAStart = i;
-          bestBStart = j;
-        }
-      }
-    }
-
-    if (bestLen === 0) return 0;
-
-    let matches = bestLen;
-
-    if (bestAStart > aStart && bestBStart > bStart) {
-      matches += countMatches(aStart, bestAStart, bStart, bestBStart);
-    }
-
-    const aRight = bestAStart + bestLen;
-    const bRight = bestBStart + bestLen;
-    if (aRight < aEnd && bRight < bEnd) {
-      matches += countMatches(aRight, aEnd, bRight, bEnd);
-    }
-
-    return matches;
-  }
-
-  const matches = countMatches(0, a.length, 0, b.length);
-  return (2.0 * matches) / totalLength;
-}
-
-function findBestFolderMatch(
-  employeeName: string,
-  folders: SharePointFolder[],
-  threshold: number = 0.6
-): FolderMatch | null {
-  if (folders.length === 0) return null;
-
-  const normalized = normalizeName(employeeName);
-  if (!normalized) return null;
-
-  let bestMatch: FolderMatch | null = null;
-
-  for (const folder of folders) {
-    const folderNormalized = normalizeName(folder.name);
-    if (!folderNormalized) continue;
-
-    if (normalized === folderNormalized) {
-      return { folder, confidence: 1.0 };
-    }
-
-    const ratio = sequenceMatchRatio(normalized, folderNormalized);
-    if (ratio >= threshold && (!bestMatch || ratio > bestMatch.confidence)) {
-      bestMatch = { folder, confidence: ratio };
-    }
-  }
-
-  return bestMatch;
 }
 
 // --- Upload ---
@@ -452,14 +370,7 @@ export async function uploadToSharePoint(
   const folderPath = `${basePath}/${resolvedFolderName}`;
   const uploadPath = `${folderPath}/${safeFileName}`;
 
-  const uploadUrl = `/drives/${driveId}/root:/${encodeURIComponent(uploadPath)}:/content`;
-
-  const response = await graphRequest('PUT', uploadUrl, {
-    body: fileBuffer,
-    contentType: 'application/pdf',
-  });
-
-  const result: any = await response.json();
+  const result = await uploadFileToDrive(driveId, uploadPath, fileBuffer);
 
   if (!isExistingFolder) {
     await invalidateFolderCache(basePath);
@@ -475,6 +386,51 @@ export async function uploadToSharePoint(
     matchConfidence,
     isExistingFolder,
   };
+}
+
+const SIMPLE_UPLOAD_LIMIT = 4 * 1024 * 1024;
+const CHUNK_SIZE = 5 * 320 * 1024; // must be a multiple of 320 KiB
+
+/**
+ * Upload a file, never overwriting: an existing file with the same name gets a
+ * numbered copy. Files over 4 MB use an upload session (simple PUT is capped at 4 MB).
+ */
+async function uploadFileToDrive(driveId: string, uploadPath: string, fileBuffer: Buffer): Promise<any> {
+  const itemPath = `/drives/${driveId}/root:/${encodeDrivePath(uploadPath)}:`;
+
+  if (fileBuffer.length <= SIMPLE_UPLOAD_LIMIT) {
+    const response = await graphRequest('PUT', `${itemPath}/content?@microsoft.graph.conflictBehavior=rename`, {
+      body: fileBuffer,
+      contentType: 'application/pdf',
+    });
+    return response.json();
+  }
+
+  const sessionResponse = await graphRequest('POST', `${itemPath}/createUploadSession`, {
+    body: JSON.stringify({ item: { '@microsoft.graph.conflictBehavior': 'rename' } }),
+    contentType: 'application/json',
+  });
+  const session: any = await sessionResponse.json();
+  const uploadUrl: string = session.uploadUrl;
+
+  let result: any = null;
+  for (let start = 0; start < fileBuffer.length; start += CHUNK_SIZE) {
+    const end = Math.min(start + CHUNK_SIZE, fileBuffer.length);
+    // The pre-authenticated upload URL must be called without an Authorization header
+    const res = await fetch(uploadUrl, {
+      method: 'PUT',
+      headers: {
+        'Content-Length': String(end - start),
+        'Content-Range': `bytes ${start}-${end - 1}/${fileBuffer.length}`,
+      },
+      body: fileBuffer.subarray(start, end),
+    });
+    if (!res.ok) {
+      throw new SharePointError(`Chunk upload failed (${res.status}): ${await res.text()}`, res.status);
+    }
+    if (res.status === 200 || res.status === 201) result = await res.json();
+  }
+  return result;
 }
 
 // --- Configuration Check ---

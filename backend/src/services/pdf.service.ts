@@ -1,1209 +1,653 @@
-import { PDFDocument, rgb, StandardFonts } from 'pdf-lib';
+import { PDFDocument, PDFFont, PDFPage, rgb, StandardFonts, pushGraphicsState, popGraphicsState } from 'pdf-lib';
 import fs from 'fs/promises';
 import path from 'path';
-import zlib from 'zlib';
+import { config } from '../utils/config.js';
 
 /**
- * Decode a PDF hex string (e.g. "48656C6C6F") to its text content ("Hello").
+ * Tag detection and stamping for Adobe Sign text tags ({{Sig_es_:signer1:signature}})
+ * and the legacy custom tags ([[SIGNATURE:role]], [[DATE:role]], [[TEXT:field]]).
+ *
+ * Detection uses pdf.js text extraction, which resolves fonts (incl. CID/Identity-H
+ * fonts with ToUnicode maps), the CTM, Form XObjects and text split across several
+ * show-text operators. Stamping uses pdf-lib: each tag is covered with a white box
+ * and the value (signature image, date, text) is drawn in its place.
  */
-function decodeHexString(hex: string): string {
-  const cleanHex = hex.replace(/\s/g, '');
-  let text = '';
-  for (let i = 0; i < cleanHex.length; i += 2) {
-    text += String.fromCharCode(parseInt(cleanHex.substring(i, i + 2), 16));
-  }
-  return text;
-}
 
-/**
- * Normalize PDF content stream by converting hex strings <AABB> to literal strings (text).
- * pdf-lib and some PDF producers encode text as hex strings, but our regex patterns
- * expect literal string format (text)Tj. This converts them so both formats are handled.
- */
-function normalizeHexStringsInStream(streamContent: string): string {
-  return streamContent.replace(/<([0-9A-Fa-f]{2}(?:\s*[0-9A-Fa-f]{2})*)>/g, (_match, hex) => {
-    const decoded = decodeHexString(hex);
-    // Escape special characters for PDF literal string format
-    const escaped = decoded
-      .replace(/\\/g, '\\\\')
-      .replace(/\(/g, '\\(')
-      .replace(/\)/g, '\\)');
-    return '(' + escaped + ')';
-  });
-}
+export type PlaceholderType = 'SIGNATURE' | 'DATE' | 'TEXT';
+export type AutoFill = 'name' | 'email' | 'initials' | 'date';
 
-export interface Placeholder {
-  type: 'SIGNATURE' | 'DATE' | 'TEXT';
-  role: string;
-  fieldName?: string;
-  originalTag: string;
-  pageNumber: number;
+export interface Box {
   x: number;
   y: number;
   width: number;
   height: number;
 }
 
-interface TagLocation {
-  tag: string;
-  pageIndex: number;
+export interface Placeholder {
+  type: PlaceholderType;
+  role: string;
+  fieldName?: string;
+  originalTag: string;
+  pageNumber: number;
+  /** Interactive field box, PDF user space, origin bottom-left. */
   x: number;
   y: number;
-  streamIndex: number;
+  width: number;
+  height: number;
+  /** Exact area covered by the tag text (whited out when stamping). */
+  tagBox?: Box;
+  fontSize?: number;
+  /** Fields the signer does not type: filled from signer identity / signing date. */
+  autoFill?: AutoFill;
+  required?: boolean;
+  /** Page MediaBox [x0, y0, x1, y1] so the viewer can map coordinates. */
+  pageView?: [number, number, number, number];
+  /** Parser version; placeholders without it come from the old regex parser. */
+  v?: number;
+}
+
+export const PLACEHOLDER_VERSION = 2;
+
+const ADOBE_TAG_RE = /\{\{[^{}]{0,200}?_es_[^{}]{0,200}?\}\}/g;
+const CUSTOM_TAG_RE = /\[\[\s*(SIGNATURE|DATE|TEXT)\s*:[^[\]]{1,120}\]\]/gi;
+
+// ─── Tag parsing ────────────────────────────────────────────────────────────
+
+interface ParsedTag {
+  type: PlaceholderType;
+  role: string;
+  fieldName: string;
+  autoFill?: AutoFill;
+  required: boolean;
 }
 
 /**
- * Extract text positions from PDF content stream using regex-based approach.
- * Finds tags and extracts their x,y coordinates from the text matrix.
+ * Parse a tag string into type / role / field name.
+ * Adobe grammar: {{[*][fieldName]_es_[:role][:fieldType][:modifiers...]}}
  */
-function extractTagPositionsFromStream(streamContent: string, tagPatterns: RegExp[]): Array<{text: string, x: number, y: number}> {
-  const results: Array<{text: string, x: number, y: number}> = [];
+export function parseTag(rawTag: string): ParsedTag | null {
+  const tag = rawTag.replace(/\s+/g, '');
 
-  // Normalize hex-encoded strings <AABB> to literal strings (text)
-  // so regex patterns designed for (text)Tj also match hex-encoded text
-  streamContent = normalizeHexStringsInStream(streamContent);
-
-  // Method 1: Find all (text)Tj patterns and look for preceding Tm
-  const textShowRegex = /\(([^)\\]*(?:\\.[^)\\]*)*)\)\s*Tj/g;
-  let match;
-
-  while ((match = textShowRegex.exec(streamContent)) !== null) {
-    let text = match[1];
-
-    // Decode escape sequences
-    text = text.replace(/\\([0-7]{1,3})/g, (_, oct) => String.fromCharCode(parseInt(oct, 8)));
-    text = text.replace(/\\n/g, '\n').replace(/\\r/g, '\r').replace(/\\t/g, '\t');
-    text = text.replace(/\\\(/g, '(').replace(/\\\)/g, ')').replace(/\\\\/g, '\\');
-
-    // Check if this text contains a tag
-    let isTag = false;
-    for (const pattern of tagPatterns) {
-      if (pattern.test(text)) {
-        isTag = true;
-        break;
-      }
+  const custom = tag.match(/^\[\[(SIGNATURE|DATE|TEXT):([^\]:]+)(?::([^\]]+))?\]\]$/i);
+  if (custom) {
+    const type = custom[1].toUpperCase() as PlaceholderType;
+    const ident = custom[2];
+    if (type === 'TEXT') {
+      // [[TEXT:fieldName]] or [[TEXT:fieldName:role]]
+      return { type, role: custom[3] || 'signer', fieldName: ident, required: false };
     }
-
-    if (!isTag) continue;
-
-    // Look for the most recent Tm before this text
-    const beforeText = streamContent.substring(0, match.index);
-
-    // Find all Tm operators (text matrix: a b c d e f Tm)
-    const tmRegex = /([\d.+-]+)\s+([\d.+-]+)\s+([\d.+-]+)\s+([\d.+-]+)\s+([\d.+-]+)\s+([\d.+-]+)\s+Tm/g;
-    let lastTm: RegExpExecArray | null = null;
-    let tmMatch;
-    while ((tmMatch = tmRegex.exec(beforeText)) !== null) {
-      lastTm = tmMatch;
-    }
-
-    // Also look for cm (current transformation matrix)
-    const cmRegex = /([\d.+-]+)\s+([\d.+-]+)\s+([\d.+-]+)\s+([\d.+-]+)\s+([\d.+-]+)\s+([\d.+-]+)\s+cm/g;
-    let lastCm: RegExpExecArray | null = null;
-    let cmMatch;
-    while ((cmMatch = cmRegex.exec(beforeText)) !== null) {
-      lastCm = cmMatch;
-    }
-
-    // Extract position
-    let x = 0;
-    let y = 0;
-
-    if (lastTm) {
-      // Tm sets text matrix: a b c d e f where e=x, f=y
-      x = parseFloat(lastTm[5]);
-      y = parseFloat(lastTm[6]);
-
-      // If there's a cm matrix, we might need to apply it
-      // But for most cases, Tm gives us the direct position
-    }
-
-    // Also check for Td/TD operators that modify position after Tm
-    if (lastTm) {
-      const afterTm = beforeText.substring(lastTm.index + lastTm[0].length);
-      const tdRegex = /([\d.+-]+)\s+([\d.+-]+)\s+T[dD]/g;
-      let tdMatch;
-      while ((tdMatch = tdRegex.exec(afterTm)) !== null) {
-        x += parseFloat(tdMatch[1]);
-        y += parseFloat(tdMatch[2]);
-      }
-    }
-
-    // If x and y are still 0 or very small, the position might be in cm matrix
-    if ((x === 0 || Math.abs(x) < 50) && lastCm) {
-      const cmX = parseFloat(lastCm[5]);
-      const cmY = parseFloat(lastCm[6]);
-      if (cmX > 50 || cmY > 50) {
-        x = cmX;
-        y = cmY;
-      }
-    }
-
-    results.push({ text, x, y });
+    return {
+      type,
+      role: ident,
+      fieldName: type === 'DATE' ? `Date_${ident}` : `Sig_${ident}`,
+      autoFill: type === 'DATE' ? 'date' : undefined,
+      required: type === 'SIGNATURE',
+    };
   }
 
-  // Method 2: Also try TJ array format: [(text1) kern (text2)] TJ
-  const tjArrayRegex = /\[((?:\([^)]*\)|[\d.-]+\s*)+)\]\s*TJ/gi;
-  while ((match = tjArrayRegex.exec(streamContent)) !== null) {
-    const arrayContent = match[1];
+  const adobe = tag.match(/^\{\{(\*?)([^{}]*?)_es_(.*)\}\}$/);
+  if (!adobe) return null;
 
-    // Extract all text strings from the array
-    const stringRegex = /\(([^)\\]*(?:\\.[^)\\]*)*)\)/g;
-    let fullText = '';
-    let strMatch;
-    while ((strMatch = stringRegex.exec(arrayContent)) !== null) {
-      let text = strMatch[1];
-      text = text.replace(/\\([0-7]{1,3})/g, (_, oct) => String.fromCharCode(parseInt(oct, 8)));
-      text = text.replace(/\\n/g, '\n').replace(/\\r/g, '\r').replace(/\\t/g, '\t');
-      text = text.replace(/\\\(/g, '(').replace(/\\\)/g, ')').replace(/\\\\/g, '\\');
-      fullText += text;
-    }
+  const required = adobe[1] === '*';
+  const name = adobe[2];
+  const segments = adobe[3].split(':').filter(Boolean);
 
-    // Check if combined text contains a tag
-    let isTag = false;
-    for (const pattern of tagPatterns) {
-      if (pattern.test(fullText)) {
-        isTag = true;
-        break;
-      }
-    }
-
-    if (!isTag) continue;
-
-    // Already processed or get position
-    const existing = results.find(r => r.text === fullText);
-    if (existing) continue;
-
-    // Look for Tm before this TJ
-    const beforeText = streamContent.substring(0, match.index);
-    const tmRegex = /([\d.+-]+)\s+([\d.+-]+)\s+([\d.+-]+)\s+([\d.+-]+)\s+([\d.+-]+)\s+([\d.+-]+)\s+Tm/g;
-    let lastTm: RegExpExecArray | null = null;
-    let tmMatch;
-    while ((tmMatch = tmRegex.exec(beforeText)) !== null) {
-      lastTm = tmMatch;
-    }
-
-    let x = 0, y = 0;
-    if (lastTm) {
-      x = parseFloat(lastTm[5]);
-      y = parseFloat(lastTm[6]);
-    }
-
-    results.push({ text: fullText, x, y });
-  }
-
-  return results;
-}
-
-/**
- * Find XObject name to object number mappings per page.
- * Returns a map: pageObjNum -> Map<xobjectName, objNum>
- * This ensures XObject names are scoped to their correct page context.
- */
-function findXObjectMappingsPerPage(rawContent: string): Map<number, Map<string, number>> {
-  const perPageMappings = new Map<number, Map<string, number>>();
-
-  // Helper to extract XObject entries from a dictionary string
-  const extractXObjects = (dictContent: string): Map<string, number> => {
-    const mappings = new Map<string, number>();
-    const xobjMatch = dictContent.match(/\/XObject\s*<<([\s\S]*?)>>/);
-    if (xobjMatch) {
-      const xobjDict = xobjMatch[1];
-      const entryRegex = /\/(\w+)\s+(\d+)\s+0\s+R/g;
-      let entryMatch;
-      while ((entryMatch = entryRegex.exec(xobjDict)) !== null) {
-        mappings.set(entryMatch[1], parseInt(entryMatch[2]));
-      }
-    }
-    return mappings;
+  const typeKeywords: Record<string, { type: PlaceholderType; autoFill?: AutoFill }> = {
+    signature: { type: 'SIGNATURE' },
+    sig: { type: 'SIGNATURE' },
+    initials: { type: 'TEXT', autoFill: 'initials' },
+    init: { type: 'TEXT', autoFill: 'initials' },
+    date: { type: 'DATE', autoFill: 'date' },
+    fullname: { type: 'TEXT', autoFill: 'name' },
+    signername: { type: 'TEXT', autoFill: 'name' },
+    name: { type: 'TEXT', autoFill: 'name' },
+    email: { type: 'TEXT', autoFill: 'email' },
+    signeremail: { type: 'TEXT', autoFill: 'email' },
   };
 
-  // Helper to find an object's dictionary content
-  const findObjDict = (objNum: number): string | null => {
-    // Handle various PDF object formats
-    const patterns = [
-      new RegExp(`${objNum}\\s+0\\s+obj\\s*<<([\\s\\S]*?)>>\\s*(?:stream|endobj)`, 's'),
-      new RegExp(`${objNum}\\s+0\\s+obj\\s*<<([\\s\\S]*?)>>`, 's'),
-    ];
-    for (const pattern of patterns) {
-      const match = rawContent.match(pattern);
-      if (match) return match[1];
+  let role = '';
+  let kind: { type: PlaceholderType; autoFill?: AutoFill } | undefined;
+
+  for (const seg of segments) {
+    const keyword = seg.toLowerCase().replace(/\(.*$/, '');
+    if (typeKeywords[keyword]) {
+      kind = kind || typeKeywords[keyword];
+    } else if (!role && !seg.includes('(')) {
+      role = seg;
     }
-    return null;
+  }
+
+  if (!kind) {
+    if (/^sig/i.test(name)) kind = { type: 'SIGNATURE' };
+    else if (/^(dte|date)/i.test(name)) kind = { type: 'DATE', autoFill: 'date' };
+    else if (/^int/i.test(name)) kind = { type: 'TEXT', autoFill: 'initials' };
+    else kind = { type: 'TEXT' };
+  }
+
+  const fieldName = name || (kind.type === 'SIGNATURE' ? 'Sig' : kind.type === 'DATE' ? 'Date' : 'Text');
+
+  return {
+    type: kind.type,
+    role: role || 'signer1',
+    fieldName,
+    autoFill: kind.autoFill,
+    required: required || kind.type === 'SIGNATURE',
   };
+}
 
-  // Find all Page objects
-  const pageObjRegex = /(\d+)\s+0\s+obj\s*<<([\s\S]*?)>>/g;
-  let match;
+// ─── Role → recipient resolution ────────────────────────────────────────────
 
-  while ((match = pageObjRegex.exec(rawContent)) !== null) {
-    const objNum = parseInt(match[1]);
-    const dictContent = match[2];
+export interface RecipientLike {
+  roleName: string;
+  order: number;
+}
 
-    // Check if this is a Page object
-    const hasMediaBox = dictContent.includes('/MediaBox') || dictContent.includes('/CropBox');
-    const isTypePage = dictContent.includes('/Type') && dictContent.includes('/Page') && !dictContent.includes('/Pages');
-    const hasParent = dictContent.includes('/Parent');
-    const hasContents = dictContent.includes('/Contents');
+/**
+ * Decide which recipient owns a tag role. Returns the index into `recipients`, or -1.
+ *  1. exact role name match ("employee" ↔ roleName "employee")
+ *  2. Adobe positional roles: signer1 → 1st signer by order, signer2 → 2nd, "signer" → 1st
+ *  3. a single recipient owns every tag
+ */
+export function resolveRecipientIndex(role: string, recipients: RecipientLike[]): number {
+  if (recipients.length === 0) return -1;
+  const r = role.trim().toLowerCase();
 
-    if ((hasMediaBox || isTypePage || hasParent) && hasContents) {
-      const pageMappings = new Map<string, number>();
+  const exact = recipients.findIndex(x => x.roleName.trim().toLowerCase() === r);
+  if (exact !== -1) return exact;
 
-      // Try inline Resources with XObject
-      let xobjects = extractXObjects(dictContent);
-      for (const [name, num] of xobjects) {
-        pageMappings.set(name, num);
+  const sorted = recipients
+    .map((x, i) => ({ order: x.order, i }))
+    .sort((a, b) => a.order - b.order);
+
+  const positional = r.match(/^signer(\d*)$/);
+  if (positional) {
+    const n = positional[1] ? parseInt(positional[1], 10) : 1;
+    if (n >= 1 && n <= sorted.length) return sorted[n - 1].i;
+  }
+  if (r === 'any' || r === '') return sorted[0].i;
+
+  if (recipients.length === 1) return 0;
+  return -1;
+}
+
+export function placeholdersForRecipient<T extends RecipientLike>(
+  placeholders: Placeholder[],
+  recipient: T,
+  allRecipients: T[]
+): Placeholder[] {
+  const idx = allRecipients.indexOf(recipient);
+  return placeholders.filter(p => resolveRecipientIndex(p.role, allRecipients) === idx);
+}
+
+// ─── Text extraction (pdf.js) ───────────────────────────────────────────────
+
+let pdfjsPromise: Promise<any> | null = null;
+function loadPdfjs(): Promise<any> {
+  if (!pdfjsPromise) {
+    pdfjsPromise = import('pdfjs-dist/legacy/build/pdf.mjs');
+  }
+  return pdfjsPromise;
+}
+
+interface TextItem {
+  str: string;
+  transform: number[];
+  width: number;
+  height: number;
+  hasEOL?: boolean;
+}
+
+let helvetica: PDFFont | null = null;
+async function getMeasureFont(): Promise<PDFFont> {
+  if (!helvetica) {
+    const doc = await PDFDocument.create();
+    helvetica = await doc.embedFont(StandardFonts.Helvetica);
+  }
+  return helvetica;
+}
+
+/** Fraction of an item's advance width taken by its first `k` characters. */
+function prefixRatio(font: PDFFont, str: string, k: number): number {
+  if (k <= 0) return 0;
+  if (k >= str.length) return 1;
+  try {
+    const total = font.widthOfTextAtSize(str, 1);
+    if (total > 0) return font.widthOfTextAtSize(str.slice(0, k), 1) / total;
+  } catch {
+    // Characters outside WinAnsi - fall back to character count
+  }
+  return k / str.length;
+}
+
+interface PageTag {
+  tag: string;
+  pageNumber: number;
+  box: Box;
+  fontSize: number;
+}
+
+async function extractTags(pdfBytes: Uint8Array | Buffer): Promise<{
+  tags: PageTag[];
+  views: Array<[number, number, number, number]>;
+}> {
+  const pdfjs = await loadPdfjs();
+  const font = await getMeasureFont();
+
+  // pdf.js may transfer/detach the buffer it is given - always pass a copy
+  const data = new Uint8Array(pdfBytes.byteLength);
+  data.set(pdfBytes);
+
+  const doc = await pdfjs.getDocument({
+    data,
+    disableFontFace: true,
+    isEvalSupported: false,
+    useSystemFonts: false,
+    verbosity: 0,
+  }).promise;
+
+  const tags: PageTag[] = [];
+  const views: Array<[number, number, number, number]> = [];
+
+  try {
+    for (let pageNumber = 1; pageNumber <= doc.numPages; pageNumber++) {
+      const page = await doc.getPage(pageNumber);
+      views.push(page.view as [number, number, number, number]);
+      const content = await page.getTextContent();
+      const items: TextItem[] = content.items.filter((i: any) => typeof i.str === 'string');
+
+      // Concatenate page text, remembering which item each character came from
+      let text = '';
+      const spans: Array<{ start: number; end: number; item: TextItem }> = [];
+      for (const item of items) {
+        spans.push({ start: text.length, end: text.length + item.str.length, item });
+        text += item.str;
+        if (item.hasEOL) text += '\n';
       }
 
-      // Check if Resources is a reference
-      const resourcesRefMatch = dictContent.match(/\/Resources\s+(\d+)\s+0\s+R/);
-      if (resourcesRefMatch) {
-        const resourcesObjNum = parseInt(resourcesRefMatch[1]);
-        const resourcesDict = findObjDict(resourcesObjNum);
-        if (resourcesDict) {
-          xobjects = extractXObjects(resourcesDict);
-          for (const [name, num] of xobjects) {
-            pageMappings.set(name, num);
-          }
+      const matches: Array<{ index: number; tag: string }> = [];
+      for (const re of [ADOBE_TAG_RE, CUSTOM_TAG_RE]) {
+        re.lastIndex = 0;
+        let m: RegExpExecArray | null;
+        while ((m = re.exec(text)) !== null) matches.push({ index: m.index, tag: m[0] });
+      }
 
-          // XObject might also be a reference inside Resources
-          const xobjRefMatch = resourcesDict.match(/\/XObject\s+(\d+)\s+0\s+R/);
-          if (xobjRefMatch) {
-            const xobjObjNum = parseInt(xobjRefMatch[1]);
-            const xobjDict = findObjDict(xobjObjNum);
-            if (xobjDict) {
-              const entryRegex = /\/(\w+)\s+(\d+)\s+0\s+R/g;
-              let entryMatch;
-              while ((entryMatch = entryRegex.exec(xobjDict)) !== null) {
-                pageMappings.set(entryMatch[1], parseInt(entryMatch[2]));
-              }
-            }
-          }
+      for (const { index, tag } of matches) {
+        const end = index + tag.length;
+        const parts = spans.filter(s => s.end > index && s.start < end && s.item.str.length > 0);
+        if (parts.length === 0) continue;
+
+        const first = parts[0].item;
+        const [a, b, c, d, e, f] = first.transform;
+        const fontSize = first.height || Math.hypot(c, d) || 10;
+        const scaleX = Math.hypot(a, b) || 1;
+        const dirX = a / scaleX;
+        const dirY = b / scaleX;
+
+        const offsetIn = (span: { start: number; item: TextItem }, pos: number) =>
+          span.item.width * prefixRatio(font, span.item.str, pos - span.start);
+
+        // Start of the tag along the baseline of the first item
+        const startAdvance = offsetIn(parts[0], index);
+        const x0 = e + dirX * startAdvance;
+        const y0 = f + dirY * startAdvance;
+
+        // End of the tag: last part on the same baseline as the first
+        let x1 = x0;
+        for (const part of parts) {
+          const [pa, pb, , , pe, pf] = part.item.transform;
+          if (Math.abs(pf - f) > fontSize * 0.5 || Math.abs(pb) > 0.01 !== Math.abs(b) > 0.01) continue;
+          const pScale = Math.hypot(pa, pb) || 1;
+          const advance = offsetIn(part, Math.min(end, part.end));
+          x1 = Math.max(x1, pe + (pa / pScale) * advance);
         }
-      }
 
-      if (pageMappings.size > 0) {
-        perPageMappings.set(objNum, pageMappings);
-        console.log(`[PDF] Page obj ${objNum}: Found ${pageMappings.size} XObject mappings`);
-      }
-    }
-  }
-
-  return perPageMappings;
-}
-
-/**
- * Find XObject name to object number mappings in all resource dictionaries.
- * Returns ALL mappings (same name can map to different objects in different dictionaries).
- */
-function findXObjectMappings(rawContent: string): Map<string, number[]> {
-  const mappings = new Map<string, number[]>();
-
-  // Look for /XObject << /Name N 0 R ... >> patterns
-  const xobjRegex = /\/XObject\s*<<([^>]+)>>/g;
-  let match;
-
-  while ((match = xobjRegex.exec(rawContent)) !== null) {
-    const dictContent = match[1];
-    const entryRegex = /\/(\w+)\s+(\d+)\s+0\s+R/g;
-    let entryMatch;
-    while ((entryMatch = entryRegex.exec(dictContent)) !== null) {
-      const name = entryMatch[1];
-      const objNum = parseInt(entryMatch[2]);
-      const existing = mappings.get(name) || [];
-      if (!existing.includes(objNum)) {
-        existing.push(objNum);
-        mappings.set(name, existing);
-      }
-    }
-  }
-
-  return mappings;
-}
-
-/**
- * Find where Form XObjects are placed on pages by looking for transformation + Do patterns.
- * The cm operator provides the x,y position where the XObject is drawn.
- *
- * Strategy: Since XObject names can map to different objects in different dictionaries,
- * we need to figure out which dictionary is active for each page. We do this by:
- * 1. Finding all XObject dictionaries in the PDF
- * 2. For each page's content stream, checking which dictionary's objects are being used
- * 3. Using that dictionary's mappings for that page
- */
-function findXObjectPlacements(
-  rawContent: string,
-  pageObjToIndex: Map<number, number>,
-  streamToPageObj: Map<number, number>,
-  perPageMappings: Map<number, Map<string, number>>,
-  globalXobjectMap: Map<string, number[]>
-): Map<number, { pageIndex: number; x: number; y: number }> {
-  const placements = new Map<number, { pageIndex: number; x: number; y: number }>();
-
-  // First, build a list of all XObject dictionaries (each mapping name->objNum)
-  const allXobjectDicts: Map<string, number>[] = [];
-  const xobjDictRegex = /\/XObject\s*<<([^>]+)>>/g;
-  let dictMatch;
-  while ((dictMatch = xobjDictRegex.exec(rawContent)) !== null) {
-    const dictContent = dictMatch[1];
-    const dictMap = new Map<string, number>();
-    const entryRegex = /\/(\w+)\s+(\d+)\s+0\s+R/g;
-    let entryMatch;
-    while ((entryMatch = entryRegex.exec(dictContent)) !== null) {
-      dictMap.set(entryMatch[1], parseInt(entryMatch[2]));
-    }
-    if (dictMap.size > 0) {
-      allXobjectDicts.push(dictMap);
-    }
-  }
-
-  console.log(`[PDF] Found ${allXobjectDicts.length} XObject dictionaries`);
-
-  // Process each page's content stream
-  for (const [contentObjNum, pageObjNum] of streamToPageObj.entries()) {
-    const pageIndex = pageObjToIndex.get(pageObjNum) ?? 0;
-
-    // Find this content stream
-    const objRegex = new RegExp(`${contentObjNum}\\s+0\\s+obj[\\s\\S]*?stream\\r?\\n([\\s\\S]*?)endstream`);
-    const objMatch = rawContent.match(objRegex);
-    if (!objMatch) continue;
-
-    let streamContent: string;
-    try {
-      const buf = Buffer.from(objMatch[1], 'latin1');
-      streamContent = zlib.inflateSync(buf).toString('latin1');
-    } catch {
-      streamContent = objMatch[1];
-    }
-
-    // Find all Do operators in this stream
-    const doPatterns = [
-      /([\d.+-]+)\s+([\d.+-]+)\s+([\d.+-]+)\s+([\d.+-]+)\s+([\d.+-]+)\s+([\d.+-]+)\s+cm\s*\/(\w+)\s+Do/g,
-      /q\s+([\d.+-]+)\s+([\d.+-]+)\s+([\d.+-]+)\s+([\d.+-]+)\s+([\d.+-]+)\s+([\d.+-]+)\s+cm\s*\/(\w+)\s+Do/g,
-    ];
-
-    // Collect all Do operators with their positions and names
-    const doOperators: Array<{ x: number; y: number; name: string }> = [];
-    for (const pattern of doPatterns) {
-      let doMatch;
-      while ((doMatch = pattern.exec(streamContent)) !== null) {
-        doOperators.push({
-          x: parseFloat(doMatch[5]),
-          y: parseFloat(doMatch[6]),
-          name: doMatch[7],
+        const width = Math.max(x1 - x0, fontSize);
+        const descent = fontSize * 0.25;
+        tags.push({
+          tag: tag.replace(/\n/g, ''),
+          pageNumber,
+          box: { x: x0, y: y0 - descent, width, height: fontSize * 1.2 },
+          fontSize,
         });
       }
-    }
 
-    // For each Do operator, find which XObject dictionary has this name
-    // and assign the position to that dictionary's object
-    for (const op of doOperators) {
-      // Try each XObject dictionary
-      for (const dict of allXobjectDicts) {
-        const objNum = dict.get(op.name);
-        if (objNum !== undefined && !placements.has(objNum)) {
-          placements.set(objNum, { pageIndex, x: op.x, y: op.y });
-        }
-      }
+      page.cleanup();
     }
+  } finally {
+    await doc.destroy();
   }
 
-  return placements;
+  return { tags, views };
 }
 
 /**
- * Build a map from page object number to page index, and stream object to page object.
+ * Parse a PDF and return a placeholder for every tag occurrence.
  */
-function buildPageMaps(rawContent: string): {
-  pageObjToIndex: Map<number, number>;
-  streamToPageObj: Map<number, number>;
-  streamToPageIndex: Map<number, number>;
-} {
-  const pageObjToIndex = new Map<number, number>();
-  const streamToPageObj = new Map<number, number>();
-  const streamToPageIndex = new Map<number, number>();
-
-  const pageObjects: Array<{ objNum: number; contentsRefs: number[] }> = [];
-
-  const objRegex = /(\d+)\s+0\s+obj\s*<<([\s\S]*?)>>/g;
-  let match;
-
-  while ((match = objRegex.exec(rawContent)) !== null) {
-    const objNum = parseInt(match[1]);
-    const dictContent = match[2];
-
-    const hasContents = dictContent.includes('/Contents');
-    const hasMediaBox = dictContent.includes('/MediaBox') || dictContent.includes('/CropBox');
-    const isTypePage = dictContent.includes('/Type') && dictContent.includes('/Page') && !dictContent.includes('/Pages');
-    const hasParent = dictContent.includes('/Parent');
-
-    if (hasContents && (hasMediaBox || isTypePage || hasParent)) {
-      const contentsRefs: number[] = [];
-
-      const singleRef = dictContent.match(/\/Contents\s+(\d+)\s+0\s+R/);
-      if (singleRef) contentsRefs.push(parseInt(singleRef[1]));
-
-      const arrayRef = dictContent.match(/\/Contents\s*\[([\s\S]*?)\]/);
-      if (arrayRef) {
-        const refs = arrayRef[1].match(/(\d+)\s+0\s+R/g);
-        if (refs) {
-          for (const ref of refs) {
-            contentsRefs.push(parseInt(ref));
-          }
-        }
-      }
-
-      if (contentsRefs.length > 0) {
-        pageObjects.push({ objNum, contentsRefs });
-      }
-    }
-  }
-
-  pageObjects.sort((a, b) => a.objNum - b.objNum);
-
-  pageObjects.forEach((page, pageIndex) => {
-    pageObjToIndex.set(page.objNum, pageIndex);
-    for (const contentRef of page.contentsRefs) {
-      streamToPageObj.set(contentRef, page.objNum);
-      streamToPageIndex.set(contentRef, pageIndex);
-    }
-  });
-
-  return { pageObjToIndex, streamToPageObj, streamToPageIndex };
-}
-
-/**
- * Find ALL tag locations in the PDF by parsing content streams.
- * IMPORTANT: Returns ALL positions for each tag, not just one.
- * Tags can appear multiple times and need to be stamped at ALL positions.
- */
-async function findTagLocations(pdfBytes: Buffer): Promise<TagLocation[]> {
-  const rawContent = pdfBytes.toString('latin1');
-  const locations: TagLocation[] = [];
-
-  const tagPatterns = [
-    /\{\{\*?[^}]+_es_:[^}]*\}\}/,
-    /\[\[(SIGNATURE|DATE|TEXT):[^\]]+\]\]/,
-  ];
-
-  // Build page mappings
-  const { pageObjToIndex, streamToPageObj, streamToPageIndex } = buildPageMaps(rawContent);
-  console.log(`[PDF] Found ${pageObjToIndex.size} pages`);
-
-  // Build per-page XObject mappings (properly scoped)
-  const perPageMappings = findXObjectMappingsPerPage(rawContent);
-  console.log(`[PDF] Found XObject mappings for ${perPageMappings.size} pages`);
-
-  // Also get global mappings as fallback
-  const globalXobjectMap = findXObjectMappings(rawContent);
-  console.log(`[PDF] Found ${globalXobjectMap.size} global XObject mappings`);
-
-  // Find where each XObject is placed on pages (using scoped mappings)
-  const xobjectPlacements = findXObjectPlacements(
-    rawContent,
-    pageObjToIndex,
-    streamToPageObj,
-    perPageMappings,
-    globalXobjectMap
-  );
-  console.log(`[PDF] Found ${xobjectPlacements.size} XObject placements`);
-
-  // Find all streams containing tags
-  const objStreamRegex = /(\d+)\s+0\s+obj[\s\S]*?stream\r?\n([\s\S]*?)endstream/g;
-  let match;
-
-  while ((match = objStreamRegex.exec(rawContent)) !== null) {
-    const objNum = parseInt(match[1]);
-    const streamData = match[2];
-
-    try {
-      if (streamData.length > 500000) continue;
-
-      const streamBuffer = Buffer.from(streamData, 'latin1');
-      let decompressedText: string;
-
-      try {
-        const decompressed = zlib.inflateSync(streamBuffer);
-        decompressedText = decompressed.toString('latin1');
-      } catch {
-        decompressedText = streamData;
-      }
-
-      // Normalize hex-encoded strings so tag patterns can match
-      const normalizedText = normalizeHexStringsInStream(decompressedText);
-
-      // Find ALL tags in this stream (use global flag to find every occurrence)
-      const foundTags: string[] = [];
-      for (const pattern of tagPatterns) {
-        const globalPattern = new RegExp(pattern.source, 'g');
-        let tagMatch;
-        while ((tagMatch = globalPattern.exec(normalizedText)) !== null) {
-          foundTags.push(tagMatch[0]);
-        }
-      }
-
-      if (foundTags.length === 0) continue;
-
-      // Extract per-tag positions from Tm/cm operators in the stream
-      const tagResults = extractTagPositionsFromStream(decompressedText, tagPatterns);
-
-      // Determine page index based on whether this is a page content or XObject
-      let pageIndex = 0;
-      let baseX = 0;
-      let baseY = 0;
-
-      if (streamToPageIndex.has(objNum)) {
-        // This is a page content stream
-        pageIndex = streamToPageIndex.get(objNum)!;
-      } else {
-        // Check if this is a Form XObject with known placement
-        const placement = xobjectPlacements.get(objNum);
-        if (placement) {
-          pageIndex = placement.pageIndex;
-          baseX = placement.x;
-          baseY = placement.y;
-          console.log(`[PDF] XObject ${objNum} at page ${pageIndex + 1}, (${baseX.toFixed(1)}, ${baseY.toFixed(1)})`);
-        } else if (pageObjToIndex.size === 0) {
-          // Page objects not found in raw PDF (e.g. pdf-lib uses object streams).
-          // Default to page 1 and rely on Tm positions from extractTagPositionsFromStream.
-          pageIndex = 0;
-          console.log(`[PDF] Stream ${objNum}: page structure not found, defaulting to page 1`);
-        }
-      }
-
-      // Build per-tag position map from extractTagPositionsFromStream results
-      // Each result contains the full text (e.g. "Employee Name: {{tag}}") and its position
-      const tagPositions: Array<{ x: number; y: number }> = [];
-      for (const result of tagResults) {
-        tagPositions.push({ x: result.x, y: result.y });
-      }
-
-      // Add ALL tags with their individual positions
-      // Use per-tag positions when available, otherwise fall back to baseX/baseY
-      for (let tIdx = 0; tIdx < foundTags.length; tIdx++) {
-        const tag = foundTags[tIdx];
-        const pos = tagPositions[tIdx] || tagPositions[0] || { x: baseX, y: baseY };
-        const x = pos.x || baseX;
-        const y = pos.y || baseY;
-
-        // Skip only if we have no valid position at all
-        if (x < 1 && y < 1) {
-          console.log(`[PDF] Skipping tag "${tag.substring(0, 30)}" - no position found`);
-          continue;
-        }
-
-        locations.push({
-          tag,
-          pageIndex,
-          x,
-          y,
-          streamIndex: objNum,
-        });
-      }
-    } catch (err) {
-      console.error(`[PDF] Error processing stream ${objNum}:`, err);
-    }
-  }
-
-  console.log(`[PDF] Found ${locations.length} total tag positions`);
-
-  // Group by tag for summary
-  const tagCounts = new Map<string, number>();
-  for (const loc of locations) {
-    const shortTag = loc.tag.substring(0, 30);
-    tagCounts.set(shortTag, (tagCounts.get(shortTag) || 0) + 1);
-  }
-  for (const [tag, count] of tagCounts.entries()) {
-    console.log(`  - "${tag}...": ${count} positions`);
-  }
-
-  return locations;
-}
-
-/**
- * Parse PDF and extract placeholder tags with their positions.
- * IMPORTANT: Creates a placeholder for EACH tag position found.
- * Tags that appear multiple times will have multiple placeholders.
- */
-export async function parseTemplatePlaceholdersFromBuffer(pdfBytes: Buffer): Promise<Placeholder[]> {
+export async function parseTemplatePlaceholdersFromBuffer(pdfBytes: Buffer | Uint8Array): Promise<Placeholder[]> {
+  const { tags, views } = await extractTags(pdfBytes);
   const placeholders: Placeholder[] = [];
 
-  // Find ALL tag locations with their positions
-  const tagLocations = await findTagLocations(pdfBytes);
-
-  console.log(`[PDF] Creating placeholders for ${tagLocations.length} tag positions`);
-
-  // Helper to parse tag and determine type/role/fieldName
-  const parseTag = (tag: string): { type: 'SIGNATURE' | 'DATE' | 'TEXT', role: string, fieldName?: string } | null => {
-    // Custom format: [[TYPE:identifier]]
-    const customMatch = tag.match(/\[\[(SIGNATURE|DATE|TEXT):([^\]]+)\]\]/);
-    if (customMatch) {
-      const type = customMatch[1] as 'SIGNATURE' | 'DATE' | 'TEXT';
-      return {
-        type,
-        role: type === 'TEXT' ? 'signer' : customMatch[2],
-        fieldName: type === 'TEXT' ? customMatch[2] : undefined,
-      };
-    }
-
-    // Adobe Sign signature: {{Sig_es_:signer1:signature}}
-    const sigMatch = tag.match(/\{\{\*?Sig\d*_es_:(\w+):signature\}\}/);
-    if (sigMatch) {
-      return { type: 'SIGNATURE', role: sigMatch[1] };
-    }
-
-    // Adobe Sign date: {{*Dte1_es_:date}} or {{*Date_es_:signer}}
-    const dateMatch = tag.match(/\{\{\*?(?:Date\w*|Dte\d*)_es_:(\w+)?(?::date)?\}\}/);
-    if (dateMatch && (tag.toLowerCase().includes('date') || tag.toLowerCase().includes('dte'))) {
-      const role = dateMatch[1] && dateMatch[1] !== 'date' ? dateMatch[1] : 'signer';
-      const fieldNameMatch = tag.match(/\{\{\*?(\w+)_es_/);
-      return {
-        type: 'DATE',
-        role,
-        fieldName: fieldNameMatch ? fieldNameMatch[1] : 'Date',
-      };
-    }
-
-    // Adobe Sign initials: {{Int_es_:signer1:initials}}
-    const initMatch = tag.match(/\{\{\*?Int\d*_es_:(\w+)(?::initials)?\}\}/i);
-    if (initMatch) {
-      return { type: 'TEXT', role: initMatch[1], fieldName: 'Int' };
-    }
-
-    // Adobe Sign text fields: {{*Lic#_es_:signer}}
-    const textMatch = tag.match(/\{\{\*?([^_]+)_es_:(\w+)(?::[^}]*)?\}\}/);
-    if (textMatch) {
-      const fieldName = textMatch[1];
-      const role = textMatch[2];
-      // Skip if it's actually a signature or date
-      if (tag.includes(':signature') || tag.includes(':date')) return null;
-      if (fieldName.startsWith('Sig') || fieldName.startsWith('Date') || fieldName.startsWith('Dte')) return null;
-      return { type: 'TEXT', role, fieldName };
-    }
-
-    return null;
-  };
-
-  // Create a placeholder for EACH tag location
-  for (const loc of tagLocations) {
-    const parsed = parseTag(loc.tag);
+  for (const t of tags) {
+    const parsed = parseTag(t.tag);
     if (!parsed) {
-      console.log(`[PDF] Could not parse tag: ${loc.tag.substring(0, 50)}`);
+      console.log(`[PDF] Could not parse tag: ${t.tag.substring(0, 60)}`);
       continue;
+    }
+
+    const box = t.box;
+    let width = box.width;
+    let height = box.height;
+    if (parsed.type === 'SIGNATURE') {
+      width = Math.max(width, 110);
+      height = Math.max(t.fontSize * 2.4, 26);
+    } else {
+      width = Math.max(width, parsed.type === 'DATE' ? 60 : 40);
+      height = Math.max(height, 12);
     }
 
     placeholders.push({
       type: parsed.type,
       role: parsed.role,
       fieldName: parsed.fieldName,
-      originalTag: loc.tag,
-      pageNumber: loc.pageIndex + 1,
-      x: loc.x,
-      y: loc.y,
-      width: parsed.type === 'SIGNATURE' ? 200 : parsed.type === 'DATE' ? 100 : 150,
-      height: parsed.type === 'SIGNATURE' ? 50 : 20,
+      originalTag: t.tag,
+      pageNumber: t.pageNumber,
+      x: box.x,
+      y: box.y,
+      width,
+      height,
+      tagBox: box,
+      fontSize: t.fontSize,
+      autoFill: parsed.autoFill,
+      required: parsed.required,
+      pageView: views[t.pageNumber - 1],
+      v: PLACEHOLDER_VERSION,
     });
   }
 
-  console.log(`[PDF] Created ${placeholders.length} placeholders from buffer`);
-
-  // Summary by type
-  const typeCounts = new Map<string, number>();
-  for (const p of placeholders) {
-    const key = `${p.type}:${p.fieldName || p.role}`;
-    typeCounts.set(key, (typeCounts.get(key) || 0) + 1);
-  }
-  for (const [key, count] of typeCounts.entries()) {
-    console.log(`  - ${key}: ${count} positions`);
-  }
-
+  console.log(`[PDF] Found ${placeholders.length} placeholders` +
+    (placeholders.length ? `: ${summarize(placeholders)}` : ''));
   return placeholders;
 }
 
-/**
- * Parse PDF file from path (legacy convenience wrapper).
- */
-export async function parseTemplatePlaceholders(pdfPath: string): Promise<Placeholder[]> {
-  const pdfBytes = await fs.readFile(pdfPath);
-  return parseTemplatePlaceholdersFromBuffer(pdfBytes);
-}
-
-/**
- * Get unique roles from placeholders
- */
-export function getUniqueRoles(placeholders: Placeholder[]): string[] {
-  const roles = new Set<string>();
+function summarize(placeholders: Placeholder[]): string {
+  const counts = new Map<string, number>();
   for (const p of placeholders) {
-    if (p.type !== 'TEXT' || p.role !== 'any') {
-      roles.add(p.role);
-    }
+    const key = `${p.type}:${p.fieldName}@${p.role}`;
+    counts.set(key, (counts.get(key) || 0) + 1);
   }
-  return Array.from(roles);
+  return Array.from(counts.entries()).map(([k, n]) => (n > 1 ? `${k} x${n}` : k)).join(', ');
 }
 
-interface SignatureData {
+/** Parse PDF file from path (convenience wrapper). */
+export async function parseTemplatePlaceholders(pdfPath: string): Promise<Placeholder[]> {
+  return parseTemplatePlaceholdersFromBuffer(await fs.readFile(pdfPath));
+}
+
+/** Unique roles referenced by placeholders. */
+export function getUniqueRoles(placeholders: Placeholder[]): string[] {
+  return Array.from(new Set(placeholders.map(p => p.role)));
+}
+
+// ─── Stamping ───────────────────────────────────────────────────────────────
+
+export interface SignatureData {
+  /** data:image/png;base64,... for drawn (and rendered typed) signatures; plain name otherwise */
   signatureImage?: string;
   typedName: string;
   signatureType: 'drawn' | 'typed';
   textFields?: Record<string, string>;
 }
 
-interface StampConfig {
+export interface StampConfig {
   role: string;
+  order?: number;
+  name?: string;
+  email?: string;
   signatureData: SignatureData;
   timestamp: Date;
 }
 
-/**
- * Helper to parse a tag and get its type, role, and field name.
- */
-function parseTagInfo(tag: string): { type: 'SIGNATURE' | 'DATE' | 'TEXT', role: string, fieldName?: string } | null {
-  // Adobe Sign signature: {{Sig_es_:signer1:signature}}
-  const sigMatch = tag.match(/\{\{\*?Sig\d*_es_:(\w+):signature\}\}/);
-  if (sigMatch) {
-    return { type: 'SIGNATURE', role: sigMatch[1] };
-  }
-
-  // Adobe Sign date: {{*Dte1_es_:date}} or similar
-  const dateMatch = tag.match(/\{\{\*?(?:Date\w*|Dte\d*)_es_:(\w+)?(?::date)?\}\}/);
-  if (dateMatch && (tag.toLowerCase().includes('date') || tag.toLowerCase().includes('dte'))) {
-    const role = dateMatch[1] && dateMatch[1] !== 'date' ? dateMatch[1] : 'signer';
-    const fieldNameMatch = tag.match(/\{\{\*?(\w+)_es_/);
-    return { type: 'DATE', role, fieldName: fieldNameMatch ? fieldNameMatch[1] : 'Date' };
-  }
-
-  // Adobe Sign initials: {{Int_es_:signer1:initials}}
-  const initMatch = tag.match(/\{\{\*?Int\d*_es_:(\w+)(?::initials)?\}\}/i);
-  if (initMatch) {
-    return { type: 'TEXT', role: initMatch[1], fieldName: 'Int' };
-  }
-
-  // Adobe Sign text fields: {{*Lic#_es_:signer}}
-  const textMatch = tag.match(/\{\{\*?([^_]+)_es_:(\w+)(?::[^}]*)?\}\}/);
-  if (textMatch) {
-    const fieldName = textMatch[1];
-    const role = textMatch[2];
-    if (tag.includes(':signature') || tag.includes(':date')) return null;
-    if (fieldName.startsWith('Sig') || fieldName.startsWith('Date') || fieldName.startsWith('Dte')) return null;
-    return { type: 'TEXT', role, fieldName };
-  }
-
-  // Custom format: [[TYPE:identifier]]
-  const customMatch = tag.match(/\[\[(SIGNATURE|DATE|TEXT):([^\]]+)\]\]/);
-  if (customMatch) {
-    const type = customMatch[1] as 'SIGNATURE' | 'DATE' | 'TEXT';
-    return { type, role: type === 'TEXT' ? 'signer' : customMatch[2], fieldName: type === 'TEXT' ? customMatch[2] : undefined };
-  }
-
-  return null;
-}
-
-/**
- * Replace tags in PDF content streams with actual values.
- * This replaces tags IN-PLACE, preserving the original position and transformation.
- * Values are rendered in blue color.
- */
-async function replaceTagsWithValues(
-  pdfBytes: Buffer,
-  valueMap: Map<string, string>
-): Promise<Buffer> {
-  let content = pdfBytes.toString('latin1');
-  let replacementsCount = 0;
-
-  // Tag patterns to find
-  const tagPatternSources = [
-    '\\{\\{\\*?[^}]+_es_:[^}]*\\}\\}',
-    '\\[\\[(SIGNATURE|DATE|TEXT):[^\\]]+\\]\\]',
-  ];
-
-  // Helper to get replacement value and type for a tag
-  const getReplacementInfo = (tag: string): { value: string; type: 'SIGNATURE' | 'DATE' | 'TEXT' } | null => {
-    const info = parseTagInfo(tag);
-    if (!info) return null;
-
-    // Build lookup key
-    let key = '';
-    if (info.type === 'SIGNATURE') {
-      key = `SIGNATURE:${info.role}`;
-    } else if (info.type === 'DATE') {
-      key = `DATE:${info.fieldName || 'Date'}`;
-    } else if (info.type === 'TEXT') {
-      key = `TEXT:${info.fieldName || info.role}`;
-    }
-
-    const value = valueMap.get(key);
-    if (value) {
-      return { value, type: info.type };
-    }
-    return null;
-  };
-
-  // Helper to escape special chars for PDF string
-  const escapePdfString = (s: string): string => {
-    return s.replace(/\\/g, '\\\\').replace(/\(/g, '\\(').replace(/\)/g, '\\)');
-  };
-
-  // Replace in streams - find (tag)Tj and <hex>Tj patterns and style appropriately
-  const streamRegex = /stream(\r?\n)([\s\S]*?)(\r?\n)endstream/g;
-  const streamReplacements: { start: number; end: number; newContent: string }[] = [];
-
-  let match;
-  while ((match = streamRegex.exec(content)) !== null) {
-    try {
-      const streamData = Buffer.from(match[2], 'latin1');
-      if (streamData.length > 500000) continue;
-
-      let text: string;
-      let isCompressed = false;
-      try {
-        text = zlib.inflateSync(streamData).toString('latin1');
-        isCompressed = true;
-      } catch {
-        text = match[2]; // Process uncompressed stream directly
-      }
-
-      // Normalize hex-encoded strings <AABB> to literal strings (text)
-      // so tag patterns work regardless of PDF encoding format
-      text = normalizeHexStringsInStream(text);
-      let modified = false;
-
-      // Find and replace tags in (text)Tj patterns
-      // Handles tags that are the entire text OR embedded within larger text strings
-      const tjPattern = /\(([^)\\]*(?:\\.[^)\\]*)*)\)\s*Tj/g;
-      text = text.replace(tjPattern, (fullMatch, textContent) => {
-        let hasReplacement = false;
-        let isSignature = false;
-
-        for (const patternSource of tagPatternSources) {
-          const tagRegex = new RegExp(patternSource, 'g');
-          if (tagRegex.test(textContent)) {
-            tagRegex.lastIndex = 0;
-            textContent = textContent.replace(tagRegex, (tag: string) => {
-              const info = getReplacementInfo(tag);
-              if (info) {
-                hasReplacement = true;
-                replacementsCount++;
-                if (info.type === 'SIGNATURE') isSignature = true;
-                return escapePdfString(info.value);
-              }
-              return tag;
-            });
-          }
-        }
-
-        if (hasReplacement) {
-          modified = true;
-          if (isSignature) {
-            // Signature: blue color with italic slant for handwritten look
-            return `q 1 0 0.2 1 0 0 cm 0 0 0.8 rg (${textContent}) Tj Q 0 0 0 rg`;
-          } else {
-            // Other fields: blue color
-            return `0 0 1 rg (${textContent}) Tj 0 0 0 rg`;
-          }
-        }
-        return fullMatch;
-      });
-
-      // Also handle standalone tags not wrapped in (text)Tj
-      for (const patternSource of tagPatternSources) {
-        const standalonePattern = new RegExp(patternSource, 'g');
-        text = text.replace(standalonePattern, (tag) => {
-          const info = getReplacementInfo(tag);
-          if (info) {
-            modified = true;
-            replacementsCount++;
-            return info.value;
-          }
-          return tag;
-        });
-      }
-
-      if (modified) {
-        let newStreamContent: string;
-        if (isCompressed) {
-          newStreamContent = zlib.deflateSync(Buffer.from(text, 'latin1')).toString('latin1');
-        } else {
-          newStreamContent = text;
-        }
-        streamReplacements.push({
-          start: match.index,
-          end: match.index + match[0].length,
-          newContent: `stream${match[1]}${newStreamContent}${match[3]}endstream`,
-        });
-      }
-    } catch {
-      // Skip
-    }
-  }
-
-  // Apply stream replacements in reverse order
-  let result = content;
-  for (let i = streamReplacements.length - 1; i >= 0; i--) {
-    const r = streamReplacements[i];
-    result = result.substring(0, r.start) + r.newContent + result.substring(r.end);
-  }
-
-  // Also replace in uncompressed content (raw PDF)
-  for (const patternSource of tagPatternSources) {
-    const pattern = new RegExp(patternSource, 'g');
-    result = result.replace(pattern, (tag) => {
-      const info = getReplacementInfo(tag);
-      if (info) {
-        replacementsCount++;
-        return info.value;
-      }
-      return tag;
+export function formatSigningDate(date: Date): string {
+  try {
+    return date.toLocaleDateString('en-US', {
+      timeZone: config.TIMEZONE,
+      year: 'numeric', month: '2-digit', day: '2-digit',
     });
+  } catch {
+    return date.toLocaleDateString('en-US');
   }
+}
 
-  console.log(`[PDF] Replaced ${replacementsCount} tags with values (styled)`);
-  return Buffer.from(result, 'latin1');
+export function initialsOf(name: string): string {
+  return name
+    .split(/\s+/)
+    .filter(Boolean)
+    .map(part => part[0]!.toUpperCase())
+    .join('');
+}
+
+/** Value a signer supplies (or that is auto-filled) for a non-signature placeholder. */
+export function valueForPlaceholder(p: Placeholder, stamp: StampConfig): string {
+  const fields = stamp.signatureData.textFields || {};
+  const name = stamp.signatureData.typedName || stamp.name || '';
+  switch (p.autoFill) {
+    case 'date': return formatSigningDate(stamp.timestamp);
+    case 'name': return fields[p.fieldName || ''] || name;
+    case 'email': return fields[p.fieldName || ''] || stamp.email || '';
+    case 'initials': return fields[p.fieldName || ''] || initialsOf(name);
+  }
+  if (p.type === 'DATE') return formatSigningDate(stamp.timestamp);
+  return fields[p.fieldName || ''] ?? '';
+}
+
+/** Replace characters the standard (WinAnsi) fonts cannot encode. */
+function encodable(font: PDFFont, text: string): string {
+  const clean = text.replace(/[\r\n\t]+/g, ' ');
+  try {
+    font.encodeText(clean);
+    return clean;
+  } catch {
+    let out = '';
+    for (const ch of clean.normalize('NFD').replace(/[̀-ͯ]/g, '')) {
+      try {
+        font.encodeText(ch);
+        out += ch;
+      } catch {
+        out += '?';
+      }
+    }
+    return out;
+  }
+}
+
+function fitTextSize(font: PDFFont, text: string, maxWidth: number, preferred: number): number {
+  let size = preferred;
+  const w = font.widthOfTextAtSize(text, size);
+  if (w > maxWidth && w > 0) size = Math.max(5, (size * maxWidth) / w);
+  return size;
+}
+
+/** Protect our drawing from graphics state left behind by the page's own content. */
+function isolatePageContent(pdfDoc: PDFDocument, page: PDFPage) {
+  page.node.normalize();
+  const start = pdfDoc.context.register(pdfDoc.context.contentStream([pushGraphicsState()]));
+  const end = pdfDoc.context.register(pdfDoc.context.contentStream([popGraphicsState()]));
+  page.node.wrapContentStreams(start, end);
+}
+
+function decodeImage(dataUrl: string): { bytes: Buffer; kind: 'png' | 'jpg' } | null {
+  const m = dataUrl.match(/^data:image\/(png|jpe?g);base64,(.+)$/i);
+  if (!m) return null;
+  return { bytes: Buffer.from(m[2], 'base64'), kind: m[1].toLowerCase() === 'png' ? 'png' : 'jpg' };
 }
 
 /**
- * Stamp signatures and form data onto PDF by replacing tags IN-PLACE.
- * This approach replaces the tag text directly in the content streams,
- * preserving the original position, rotation, and transformation.
+ * Stamp all signer values onto the original PDF.
+ *
+ * Placeholders are re-detected from the original document so geometry is always
+ * computed by the current parser; `_storedPlaceholders` is kept for API compatibility.
  */
 export async function stampSignatureFromBuffer(
-  originalPdfBytes: Buffer,
+  originalPdfBytes: Buffer | Uint8Array,
   stamps: StampConfig[],
-  placeholders: Placeholder[]
+  _storedPlaceholders?: Placeholder[]
 ): Promise<Uint8Array> {
-  // Build a map of tag types to values
-  const valueMap = new Map<string, string>();
+  const placeholders = await parseTemplatePlaceholdersFromBuffer(originalPdfBytes);
 
-  for (const stamp of stamps) {
-    console.log(`[PDF] Building value map for role: ${stamp.role}`);
+  const pdfDoc = await PDFDocument.load(originalPdfBytes, { updateMetadata: false });
+  const textFont = await pdfDoc.embedFont(StandardFonts.Helvetica);
+  const scriptFont = await pdfDoc.embedFont(StandardFonts.TimesRomanItalic);
 
-    // Signature value
-    valueMap.set(`SIGNATURE:${stamp.role}`, stamp.signatureData.typedName);
-    valueMap.set('SIGNATURE:signer', stamp.signatureData.typedName);
-    valueMap.set('SIGNATURE:signer1', stamp.signatureData.typedName);
+  const recipientsLike: RecipientLike[] = stamps.map((s, i) => ({ roleName: s.role, order: s.order ?? i + 1 }));
 
-    // Date value - set common keys
-    const dateValue = stamp.signatureData.textFields?.['Dte1']
-      || stamp.signatureData.textFields?.['Date']
-      || stamp.timestamp.toLocaleDateString('en-US');
-    valueMap.set('DATE:Dte1', dateValue);
-    valueMap.set('DATE:Date', dateValue);
-    valueMap.set('DATE:date', dateValue);
-
-    // Also map date values from actual placeholder fieldNames
-    // (tags like {{DateA_es_:signer1:date}} have fieldName "DateA")
-    for (const p of placeholders) {
-      if (p.type === 'DATE' && p.fieldName) {
-        const val = stamp.signatureData.textFields?.[p.fieldName] || dateValue;
-        valueMap.set(`DATE:${p.fieldName}`, val);
-      }
-    }
-
-    // Text fields (initials, license, etc.)
-    if (stamp.signatureData.textFields) {
-      for (const [fieldName, value] of Object.entries(stamp.signatureData.textFields)) {
-        valueMap.set(`TEXT:${fieldName}`, value);
-      }
+  // Embed each signer's signature image once
+  const images = new Map<number, Awaited<ReturnType<PDFDocument['embedPng']>>>();
+  for (let i = 0; i < stamps.length; i++) {
+    const raw = stamps[i].signatureData.signatureImage;
+    const img = raw ? decodeImage(raw) : null;
+    if (!img) continue;
+    try {
+      images.set(i, img.kind === 'png' ? await pdfDoc.embedPng(img.bytes) : await pdfDoc.embedJpg(img.bytes));
+    } catch (err) {
+      console.error(`[PDF] Could not embed signature image for ${stamps[i].role}:`, err);
     }
   }
 
-  console.log('[PDF] Value map:', Object.fromEntries(valueMap));
+  const isolated = new Set<number>();
+  const signaturePlaced = new Set<number>();
+  const ink = rgb(0.05, 0.1, 0.45);
 
-  // Step 1: Replace tags with values IN-PLACE (text replacement in streams)
-  console.log('[PDF] Replacing tags with values in-place...');
-  const modifiedPdfBytes = await replaceTagsWithValues(originalPdfBytes, valueMap);
-
-  // Step 2: Load the modified PDF with pdf-lib for image embedding
-  const pdfDoc = await PDFDocument.load(modifiedPdfBytes);
-
-  // Step 3: Embed signature IMAGES for drawn signatures on the correct pages
-  for (const stamp of stamps) {
-    if (stamp.signatureData.signatureType === 'drawn' && stamp.signatureData.signatureImage) {
-      console.log(`[PDF] Embedding signature image for role: ${stamp.role}`);
-
-      // Find SIGNATURE placeholders that match this signer's role
-      const sigPlaceholders = placeholders.filter(p =>
-        p.type === 'SIGNATURE' &&
-        (p.role === stamp.role || p.role === 'signer' || p.role === 'signer1' ||
-         stamp.role.startsWith(p.role) || p.role.startsWith(stamp.role))
-      );
-
-      if (sigPlaceholders.length === 0) {
-        console.log(`[PDF] No SIGNATURE placeholders found for role: ${stamp.role}`);
-        continue;
-      }
-
-      // Parse the base64 image data
-      const base64Data = stamp.signatureData.signatureImage.replace(/^data:image\/\w+;base64,/, '');
-      const imageBytes = Buffer.from(base64Data, 'base64');
-
-      // Try to embed as PNG first (SignaturePad produces PNGs), then JPG
-      let image;
-      try {
-        image = await pdfDoc.embedPng(imageBytes);
-        console.log(`[PDF] Embedded PNG signature image: ${image.width}x${image.height}`);
-      } catch {
-        try {
-          image = await pdfDoc.embedJpg(imageBytes);
-          console.log(`[PDF] Embedded JPG signature image: ${image.width}x${image.height}`);
-        } catch (imgErr) {
-          console.error('[PDF] Could not embed signature image:', imgErr);
-          continue; // text replacement already handled it
-        }
-      }
-
-      // Draw the signature image on each matching placeholder location
-      for (const p of sigPlaceholders) {
-        const pageIndex = p.pageNumber - 1; // pdf-lib uses 0-based page index
-        if (pageIndex < 0 || pageIndex >= pdfDoc.getPageCount()) {
-          console.warn(`[PDF] Skipping signature on invalid page ${p.pageNumber}`);
-          continue;
-        }
-
-        const page = pdfDoc.getPage(pageIndex);
-
-        // Scale image to fit the placeholder area while maintaining aspect ratio
-        const imgAspect = image.width / image.height;
-        const boxAspect = p.width / p.height;
-        let drawW = p.width;
-        let drawH = p.height;
-        let drawX = p.x;
-        let drawY = p.y; // PDF y-coordinate (bottom of field from page bottom)
-
-        if (imgAspect > boxAspect) {
-          // Image is wider than box — fit to width, center vertically
-          drawH = p.width / imgAspect;
-          drawY += (p.height - drawH) / 2;
-        } else {
-          // Image is taller — fit to height, center horizontally
-          drawW = p.height * imgAspect;
-          drawX += (p.width - drawW) / 2;
-        }
-
-        console.log(`[PDF] Drawing signature on page ${p.pageNumber} at (${drawX.toFixed(1)}, ${drawY.toFixed(1)}) ${drawW.toFixed(1)}x${drawH.toFixed(1)}`);
-        page.drawImage(image, {
-          x: drawX,
-          y: drawY,
-          width: drawW,
-          height: drawH,
-        });
-      }
+  for (const p of placeholders) {
+    const pageIndex = p.pageNumber - 1;
+    if (pageIndex < 0 || pageIndex >= pdfDoc.getPageCount()) continue;
+    const page = pdfDoc.getPage(pageIndex);
+    if (!isolated.has(pageIndex)) {
+      isolatePageContent(pdfDoc, page);
+      isolated.add(pageIndex);
     }
+
+    // Remove the tag text
+    const tb = p.tagBox || { x: p.x, y: p.y, width: p.width, height: p.height };
+    page.drawRectangle({
+      x: tb.x - 0.5, y: tb.y, width: tb.width + 1, height: tb.height,
+      color: rgb(1, 1, 1), borderWidth: 0,
+    });
+
+    const owner = resolveRecipientIndex(p.role, recipientsLike);
+    if (owner === -1) {
+      console.warn(`[PDF] No signer for tag ${p.originalTag} (role "${p.role}") - tag removed, left blank`);
+      continue;
+    }
+    const stamp = stamps[owner];
+    const fontSize = p.fontSize || 10;
+
+    if (p.type === 'SIGNATURE') {
+      const image = images.get(owner);
+      if (image) {
+        const scale = Math.min(p.width / image.width, p.height / image.height);
+        const w = image.width * scale;
+        const h = image.height * scale;
+        page.drawImage(image, { x: p.x, y: p.y, width: w, height: h });
+      } else {
+        const name = encodable(scriptFont, stamp.signatureData.typedName || stamp.name || '');
+        const size = fitTextSize(scriptFont, name, p.width, Math.min(p.height * 0.7, Math.max(fontSize * 1.6, 14)));
+        page.drawText(name, { x: p.x, y: p.y + p.height * 0.25, size, font: scriptFont, color: ink });
+      }
+      signaturePlaced.add(owner);
+      continue;
+    }
+
+    const value = encodable(textFont, valueForPlaceholder(p, stamp));
+    if (!value) continue;
+    const size = fitTextSize(textFont, value, Math.max(p.width, tb.width), Math.min(fontSize, 12));
+    const baseline = (p.tagBox ? p.tagBox.y : p.y) + fontSize * 0.25;
+    page.drawText(value, { x: tb.x, y: baseline, size, font: textFont, color: rgb(0, 0, 0) });
   }
 
-  console.log('[PDF] Stamping complete');
+  // Any signer whose signature had no field gets it on a signature page
+  const unplaced = stamps.map((s, i) => ({ s, i })).filter(({ i }) => !signaturePlaced.has(i));
+  if (unplaced.length > 0) {
+    await appendSignaturePage(pdfDoc, unplaced.map(({ s, i }) => ({ stamp: s, image: images.get(i) })), textFont, scriptFont);
+  }
 
   return pdfDoc.save();
 }
 
-/**
- * Stamp signatures from a file path (legacy convenience wrapper).
- */
+async function appendSignaturePage(
+  pdfDoc: PDFDocument,
+  entries: Array<{ stamp: StampConfig; image?: Awaited<ReturnType<PDFDocument['embedPng']>> }>,
+  font: PDFFont,
+  scriptFont: PDFFont
+) {
+  const bold = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
+  let page = pdfDoc.addPage([612, 792]);
+  let y = 730;
+  page.drawText('Signatures', { x: 50, y, size: 18, font: bold });
+  y -= 40;
+
+  for (const { stamp, image } of entries) {
+    if (y < 140) {
+      page = pdfDoc.addPage([612, 792]);
+      y = 730;
+    }
+    const name = encodable(font, stamp.signatureData.typedName || stamp.name || stamp.role);
+    page.drawText(`${name}${stamp.email ? ` (${encodable(font, stamp.email)})` : ''}`, { x: 50, y, size: 11, font: bold });
+    y -= 60;
+    if (image) {
+      const scale = Math.min(220 / image.width, 50 / image.height);
+      page.drawImage(image, { x: 50, y, width: image.width * scale, height: image.height * scale });
+    } else {
+      page.drawText(encodable(scriptFont, name), { x: 50, y: y + 12, size: 24, font: scriptFont, color: rgb(0.05, 0.1, 0.45) });
+    }
+    page.drawLine({ start: { x: 50, y: y - 4 }, end: { x: 300, y: y - 4 }, thickness: 0.75 });
+    y -= 18;
+    page.drawText(`Signed electronically on ${formatSigningDate(stamp.timestamp)} - role: ${encodable(font, stamp.role)}`, {
+      x: 50, y, size: 9, font, color: rgb(0.3, 0.3, 0.3),
+    });
+    y -= 40;
+  }
+}
+
+/** Stamp signatures from a file path (convenience wrapper). */
 export async function stampSignature(
   pdfPath: string,
   stamps: StampConfig[],
-  placeholders: Placeholder[]
+  placeholders?: Placeholder[]
 ): Promise<Uint8Array> {
-  const originalPdfBytes = await fs.readFile(pdfPath);
-  return stampSignatureFromBuffer(originalPdfBytes, stamps, placeholders);
+  return stampSignatureFromBuffer(await fs.readFile(pdfPath), stamps, placeholders);
 }
 
-/**
- * Save stamped PDF to disk
- */
-export async function saveStampedPdf(
-  pdfBytes: Uint8Array,
-  packetId: string
-): Promise<string> {
+/** Save stamped PDF to disk */
+export async function saveStampedPdf(pdfBytes: Uint8Array, packetId: string): Promise<string> {
   const signedDir = path.join(process.cwd(), 'signed');
-
-  try {
-    await fs.mkdir(signedDir, { recursive: true });
-  } catch {
-    // Directory may already exist
-  }
-
-  const fileName = `signed_${packetId}_${Date.now()}.pdf`;
-  const filePath = path.join(signedDir, fileName);
+  await fs.mkdir(signedDir, { recursive: true });
+  const filePath = path.join(signedDir, `signed_${packetId}_${Date.now()}.pdf`);
   await fs.writeFile(filePath, pdfBytes);
   return filePath;
 }
 
-/**
- * Create a PDF with sample placeholders for demo purposes
- */
+/** Create a PDF with sample placeholders for demo purposes */
 export async function createSampleTemplate(name: string, roles: string[]): Promise<Uint8Array> {
   const pdfDoc = await PDFDocument.create();
   const page = pdfDoc.addPage([612, 792]);
   const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
   const boldFont = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
 
-  page.drawText(name, {
-    x: 50,
-    y: 720,
-    size: 24,
-    font: boldFont,
-    color: rgb(0, 0, 0),
-  });
-
-  page.drawText('This document requires signatures from the following parties:', {
-    x: 50,
-    y: 680,
-    size: 12,
-    font: font,
-    color: rgb(0, 0, 0),
-  });
+  page.drawText(name, { x: 50, y: 720, size: 24, font: boldFont });
+  page.drawText('This document requires signatures from the following parties:', { x: 50, y: 680, size: 12, font });
 
   let yPos = 620;
-
   for (const role of roles) {
-    page.drawText(`${role.charAt(0).toUpperCase() + role.slice(1)} Signature:`, {
-      x: 50,
-      y: yPos,
-      size: 12,
-      font: boldFont,
-      color: rgb(0, 0, 0),
-    });
-
-    page.drawText(`[[SIGNATURE:${role}]]`, {
-      x: 50,
-      y: yPos - 25,
-      size: 10,
-      font: font,
-      color: rgb(0.6, 0.6, 0.6),
-    });
-
-    page.drawLine({
-      start: { x: 50, y: yPos - 40 },
-      end: { x: 250, y: yPos - 40 },
-      thickness: 1,
-      color: rgb(0, 0, 0),
-    });
-
-    page.drawText('Date:', {
-      x: 300,
-      y: yPos - 25,
-      size: 10,
-      font: font,
-      color: rgb(0, 0, 0),
-    });
-
-    page.drawText(`[[DATE:${role}]]`, {
-      x: 340,
-      y: yPos - 25,
-      size: 10,
-      font: font,
-      color: rgb(0.6, 0.6, 0.6),
-    });
-
+    page.drawText(`${role.charAt(0).toUpperCase() + role.slice(1)} Signature:`, { x: 50, y: yPos, size: 12, font: boldFont });
+    page.drawText(`[[SIGNATURE:${role}]]`, { x: 50, y: yPos - 25, size: 10, font, color: rgb(0.6, 0.6, 0.6) });
+    page.drawLine({ start: { x: 50, y: yPos - 40 }, end: { x: 250, y: yPos - 40 }, thickness: 1 });
+    page.drawText('Date:', { x: 300, y: yPos - 25, size: 10, font });
+    page.drawText(`[[DATE:${role}]]`, { x: 340, y: yPos - 25, size: 10, font, color: rgb(0.6, 0.6, 0.6) });
     yPos -= 100;
   }
 
   page.drawText('This is a sample document for demonstration purposes.', {
-    x: 50,
-    y: 50,
-    size: 10,
-    font: font,
-    color: rgb(0.5, 0.5, 0.5),
+    x: 50, y: 50, size: 10, font, color: rgb(0.5, 0.5, 0.5),
   });
 
   return pdfDoc.save();

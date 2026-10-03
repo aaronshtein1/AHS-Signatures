@@ -9,9 +9,9 @@ import { authService } from '../services/auth.service.js';
 import {
   isSharePointConfigured,
   testSharePointConnection,
-  uploadToSharePoint,
   refreshFolderCache,
 } from '../services/sharepoint.service.js';
+import { finalizePacket, uploadPacketToSharePoint, signedFileNameFor } from '../services/completion.service.js';
 import { downloadFile } from '../utils/storage.js';
 
 export const adminRoutes = new Hono();
@@ -317,7 +317,7 @@ adminRoutes.get('/packets/:packetId/download', async (c) => {
 
   try {
     const pdfBuffer = await downloadFile(packet.signedPdfPath);
-    const fileName = `${packet.name.replace(/[^a-zA-Z0-9]/g, '_')}_signed.pdf`;
+    const fileName = signedFileNameFor(packet.name).replace(/[^a-zA-Z0-9._-]/g, '_');
     return new Response(pdfBuffer, {
       headers: {
         'Content-Type': 'application/pdf',
@@ -326,6 +326,22 @@ adminRoutes.get('/packets/:packetId/download', async (c) => {
     });
   } catch {
     return c.json({ error: 'PDF file not found' }, 404);
+  }
+});
+
+// Retry generating the signed PDF for a packet whose signers are all done
+adminRoutes.post('/packets/:packetId/finalize', async (c) => {
+  const packet = await db.query.signingPackets.findFirst({
+    where: eq(signingPackets.id, c.req.param('packetId')),
+  });
+  if (!packet) return c.json({ error: 'Packet not found' }, 404);
+  if (packet.status === 'completed') return c.json({ error: 'Packet is already completed' }, 400);
+
+  try {
+    const result = await finalizePacket(packet.id);
+    return c.json({ success: true, ...result });
+  } catch (err) {
+    return c.json({ error: `Finalization failed: ${err instanceof Error ? err.message : String(err)}` }, 400);
   }
 });
 
@@ -413,39 +429,10 @@ adminRoutes.post('/sharepoint/retry/:packetId', async (c) => {
   }
 
   try {
-    const pdfBuffer = await downloadFile(packet.signedPdfPath);
-    const employeeName = packet.employeeName || packet.name;
-    const signedFileName = `${packet.name.replace(/[^a-zA-Z0-9]/g, '_')}_signed.pdf`;
-
-    let subfolder: string | null = null;
-    if (packet.formRouteId) {
-      const formRoute = await db.query.formRoutes.findFirst({
-        where: eq(formRoutes.id, packet.formRouteId),
-      });
-      subfolder = formRoute?.sharepointFolder || null;
-    }
-
-    const uploadResult = await uploadToSharePoint(employeeName, signedFileName, pdfBuffer, subfolder);
-
-    await db.update(signingPackets)
-      .set({ sharepointUrl: uploadResult.url, sharepointFolder: uploadResult.folderName, sharepointError: null })
-      .where(eq(signingPackets.id, packet.id));
-
-    const matchInfo = uploadResult.isExistingFolder
-      ? `matched existing folder "${uploadResult.folderName}" (${Math.round(uploadResult.matchConfidence * 100)}% confidence)`
-      : `created new folder "${uploadResult.folderName}"`;
-
-    await db.insert(auditLogs).values({
-      packetId: packet.id, action: 'uploaded', details: `Retry: Signed PDF uploaded to SharePoint: ${uploadResult.url} — ${matchInfo}`,
-    });
-
-    return c.json({ success: true, url: uploadResult.url, folderName: uploadResult.folderName, matchInfo });
+    const result = await uploadPacketToSharePoint(packet.id, undefined, 'Retry: ');
+    return c.json({ success: true, url: result.url, folderName: result.folderName, matchInfo: result.matchInfo });
   } catch (err) {
     const errorMsg = err instanceof Error ? err.message : String(err);
-    await db.update(signingPackets).set({ sharepointError: errorMsg }).where(eq(signingPackets.id, packet.id)).catch(() => {});
-    await db.insert(auditLogs).values({
-      packetId: packet.id, action: 'upload_failed', details: `Retry failed: ${errorMsg}`,
-    }).catch(() => {});
     return c.json({ error: `SharePoint upload failed: ${errorMsg}` }, 500);
   }
 });
@@ -473,33 +460,7 @@ adminRoutes.post('/sharepoint/retry-all', async (c) => {
 
   for (const pkt of failedPackets) {
     try {
-      const packet = await db.query.signingPackets.findFirst({
-        where: eq(signingPackets.id, pkt.id),
-      });
-      if (!packet || !packet.signedPdfPath) continue;
-
-      const pdfBuffer = await downloadFile(packet.signedPdfPath);
-      const employeeName = packet.employeeName || packet.name;
-      const signedFileName = `${packet.name.replace(/[^a-zA-Z0-9]/g, '_')}_signed.pdf`;
-
-      let subfolder: string | null = null;
-      if (packet.formRouteId) {
-        const formRoute = await db.query.formRoutes.findFirst({
-          where: eq(formRoutes.id, packet.formRouteId),
-        });
-        subfolder = formRoute?.sharepointFolder || null;
-      }
-
-      const uploadResult = await uploadToSharePoint(employeeName, signedFileName, pdfBuffer, subfolder);
-
-      await db.update(signingPackets)
-        .set({ sharepointUrl: uploadResult.url, sharepointFolder: uploadResult.folderName, sharepointError: null })
-        .where(eq(signingPackets.id, packet.id));
-
-      await db.insert(auditLogs).values({
-        packetId: packet.id, action: 'uploaded', details: `Bulk retry: Uploaded to SharePoint: ${uploadResult.url}`,
-      });
-
+      await uploadPacketToSharePoint(pkt.id, undefined, 'Bulk retry: ');
       succeeded++;
     } catch (err) {
       failed++;

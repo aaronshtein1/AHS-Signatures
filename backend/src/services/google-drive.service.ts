@@ -68,6 +68,10 @@ async function getAuthenticatedClient() {
   return client;
 }
 
+function escapeQueryValue(value: string): string {
+  return value.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+}
+
 export interface DriveFile {
   id: string;
   name: string;
@@ -80,7 +84,7 @@ export async function listFiles(folderId: string, since?: Date): Promise<DriveFi
   const auth = await getAuthenticatedClient();
   const drive = google.drive({ version: 'v3', auth });
 
-  let query = `'${folderId}' in parents and mimeType = 'application/pdf' and trashed = false`;
+  let query = `'${escapeQueryValue(folderId)}' in parents and mimeType = 'application/pdf' and trashed = false`;
   if (since) {
     query += ` and modifiedTime > '${since.toISOString()}'`;
   }
@@ -95,6 +99,9 @@ export async function listFiles(folderId: string, since?: Date): Promise<DriveFi
       orderBy: 'modifiedTime desc',
       pageSize: 100,
       pageToken,
+      // Required for folders that live in a Shared Drive (otherwise the list is silently empty)
+      supportsAllDrives: true,
+      includeItemsFromAllDrives: true,
     });
 
     const files = (response.data.files || []) as DriveFile[];
@@ -110,16 +117,25 @@ export async function listFolders(parentId?: string): Promise<DriveFile[]> {
   const drive = google.drive({ version: 'v3', auth });
 
   const parent = parentId || 'root';
-  const query = `'${parent}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false`;
+  const query = `'${escapeQueryValue(parent)}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false`;
 
-  const response = await drive.files.list({
-    q: query,
-    fields: 'files(id, name, mimeType, modifiedTime)',
-    orderBy: 'name',
-    pageSize: 100,
-  });
+  const folders: DriveFile[] = [];
+  let pageToken: string | undefined;
+  do {
+    const response = await drive.files.list({
+      q: query,
+      fields: 'nextPageToken, files(id, name, mimeType, modifiedTime)',
+      orderBy: 'name',
+      pageSize: 100,
+      pageToken,
+      supportsAllDrives: true,
+      includeItemsFromAllDrives: true,
+    });
+    folders.push(...((response.data.files || []) as DriveFile[]));
+    pageToken = response.data.nextPageToken || undefined;
+  } while (pageToken);
 
-  return (response.data.files || []) as DriveFile[];
+  return folders;
 }
 
 export async function downloadFile(fileId: string): Promise<Buffer> {
@@ -127,7 +143,7 @@ export async function downloadFile(fileId: string): Promise<Buffer> {
   const drive = google.drive({ version: 'v3', auth });
 
   const response = await drive.files.get(
-    { fileId, alt: 'media' },
+    { fileId, alt: 'media', supportsAllDrives: true },
     { responseType: 'arraybuffer' }
   );
 

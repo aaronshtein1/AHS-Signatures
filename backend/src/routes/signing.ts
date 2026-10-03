@@ -1,13 +1,12 @@
 import { Hono } from 'hono';
-import { db, signingPackets, recipients, signatures, auditLogs, formRoutes, eq } from '../db/index.js';
+import { db, signingPackets, recipients, signatures, auditLogs, eq } from '../db/index.js';
 import { isTokenExpired, generateSecureToken, getTokenExpiryDate, generateSigningUrl } from '../utils/token.js';
-import { stampSignatureFromBuffer, Placeholder } from '../services/pdf.service.js';
-import { sendSigningRequest, sendCompletionEmail } from '../services/email.service.js';
-import { downloadFile, uploadFile } from '../utils/storage.js';
+import { placeholdersForRecipient } from '../services/pdf.service.js';
+import { sendSigningRequest } from '../services/email.service.js';
+import { finalizePacket, getCurrentPlaceholders } from '../services/completion.service.js';
+import { downloadFile } from '../utils/storage.js';
 import { z } from 'zod';
 import crypto from 'crypto';
-import { config } from '../utils/config.js';
-import { uploadToSharePoint, isSharePointConfigured } from '../services/sharepoint.service.js';
 
 const signDocumentSchema = z.object({
   signatureData: z.string().min(1),
@@ -36,7 +35,6 @@ signingRoutes.get('/:token', async (c) => {
           },
         },
       },
-      signature: true,
     },
   });
 
@@ -62,15 +60,10 @@ signingRoutes.get('/:token', async (c) => {
     userAgent: c.req.header('user-agent') || undefined,
   });
 
-  const placeholders = JSON.parse(recipient.packet.placeholders as string);
-  const recipientPlaceholders = placeholders.filter(
-    (p: Placeholder) => {
-      if (p.type === 'TEXT' || p.type === 'DATE') return true;
-      if (p.role === recipient.roleName) return true;
-      if (recipient.roleName.startsWith(p.role) || p.role.startsWith(recipient.roleName)) return true;
-      return false;
-    }
-  );
+  const { recipients: packetRecipients, ...packetRow } = recipient.packet;
+  const placeholders = await getCurrentPlaceholders(packetRow as any);
+  const self = packetRecipients.find(r => r.id === recipient.id)!;
+  const recipientPlaceholders = placeholdersForRecipient(placeholders, self, packetRecipients);
 
   return c.json({
     recipient: { id: recipient.id, name: recipient.name, email: recipient.email, roleName: recipient.roleName },
@@ -115,6 +108,8 @@ signingRoutes.post('/:token/sign', async (c) => {
   if (!recipient) return c.json({ error: 'Invalid or expired signing link' }, 404);
   if (isTokenExpired(recipient.tokenExpiresAt)) return c.json({ error: 'This signing link has expired' }, 410);
   if (recipient.status === 'signed') return c.json({ error: 'You have already signed this document' }, 400);
+  if (recipient.packet.status === 'cancelled') return c.json({ error: 'This signing request has been cancelled' }, 400);
+  if (recipient.packet.status === 'completed') return c.json({ error: 'This document has already been completed' }, 400);
 
   const pendingBefore = recipient.packet.recipients.filter(
     r => r.order < recipient.order && r.status !== 'signed'
@@ -134,16 +129,25 @@ signingRoutes.post('/:token/sign', async (c) => {
     signedAt: signedAt.toISOString(),
   });
 
-  await db.insert(signatures).values({
-    recipientId: recipient.id,
-    signatureData, signatureType, typedName,
-    textFields: textFields ? JSON.stringify(textFields) : null,
-    ipAddress: clientIp, userAgent, attestationText, identityRecord,
-  });
-
-  await db.update(recipients)
-    .set({ status: 'signed', signedAt })
-    .where(eq(recipients.id, recipient.id));
+  try {
+    await db.transaction(async (tx) => {
+      await tx.insert(signatures).values({
+        recipientId: recipient.id,
+        signatureData, signatureType, typedName,
+        textFields: textFields ? JSON.stringify(textFields) : null,
+        ipAddress: clientIp, userAgent, attestationText, identityRecord,
+      });
+      await tx.update(recipients)
+        .set({ status: 'signed', signedAt })
+        .where(eq(recipients.id, recipient.id));
+    });
+  } catch (err: any) {
+    // Unique violation on recipientId: a duplicate submit (double click / two tabs)
+    if (err?.code === '23505' || err?.cause?.code === '23505') {
+      return c.json({ error: 'You have already signed this document' }, 409);
+    }
+    throw err;
+  }
 
   await db.insert(auditLogs).values({
     packetId: recipient.packetId, recipientId: recipient.id,
@@ -167,92 +171,15 @@ signingRoutes.post('/:token/sign', async (c) => {
   const allSigned = allRecipients.every(r => r.status === 'signed');
 
   if (allSigned) {
-    const documentBuffer = await downloadFile(recipient.packet.filePath);
-    const placeholders = JSON.parse(recipient.packet.placeholders as string);
-
-    const stamps = allRecipients.map(r => ({
-      role: r.roleName,
-      signatureData: {
-        signatureImage: r.signature?.signatureData,
-        typedName: r.signature?.typedName || r.name,
-        signatureType: (r.signature?.signatureType || 'typed') as 'drawn' | 'typed',
-        textFields: r.signature?.textFields ? JSON.parse(r.signature.textFields as string) : undefined,
-      },
-      timestamp: r.signedAt || new Date(),
-    }));
-
-    const stampedPdf = await stampSignatureFromBuffer(documentBuffer, stamps, placeholders);
-
-    const pdfBuffer = Buffer.from(stampedPdf);
-    const signedKey = `signed/signed_${recipient.packetId}_${Date.now()}.pdf`;
-    await uploadFile(signedKey, pdfBuffer);
-
-    const pdfHash = crypto.createHash('sha256').update(pdfBuffer).digest('hex');
-
-    await db.update(signingPackets)
-      .set({ status: 'completed', signedPdfPath: signedKey, signedPdfHash: pdfHash, completedAt: new Date() })
-      .where(eq(signingPackets.id, recipient.packetId));
-
-    await db.insert(auditLogs).values({
-      packetId: recipient.packetId, action: 'completed',
-      details: `All signatures collected, document completed. PDF integrity hash (SHA-256): ${pdfHash}`,
-    });
-
     try {
-      await sendCompletionEmail(config.ADMIN_EMAIL, 'Admin', recipient.packet.name, pdfBuffer, true);
+      await finalizePacket(recipient.packetId);
     } catch (err) {
-      console.error('Failed to send admin notification:', err);
-    }
-
-    for (const r of allRecipients) {
-      try {
-        await sendCompletionEmail(r.email, r.name, recipient.packet.name, pdfBuffer, false);
-      } catch (err) {
-        console.error(`Failed to send completion email to ${r.email}:`, err);
-      }
-    }
-
-    // Upload to SharePoint if configured
-    if (isSharePointConfigured()) {
-      try {
-        const fullPacket = await db.query.signingPackets.findFirst({
-          where: eq(signingPackets.id, recipient.packetId),
-        });
-        const employeeName = fullPacket?.employeeName || recipient.packet.name;
-        const signedFileName = `${recipient.packet.name}_signed.pdf`;
-
-        let subfolder: string | null = null;
-        if (fullPacket?.formRouteId) {
-          const formRoute = await db.query.formRoutes.findFirst({
-            where: eq(formRoutes.id, fullPacket.formRouteId),
-          });
-          subfolder = formRoute?.sharepointFolder || null;
-        }
-
-        const uploadResult = await uploadToSharePoint(employeeName, signedFileName, pdfBuffer, subfolder);
-
-        await db.update(signingPackets)
-          .set({ sharepointUrl: uploadResult.url, sharepointFolder: uploadResult.folderName, sharepointError: null })
-          .where(eq(signingPackets.id, recipient.packetId));
-
-        const matchInfo = uploadResult.isExistingFolder
-          ? `matched existing folder "${uploadResult.folderName}" (${Math.round(uploadResult.matchConfidence * 100)}% confidence)`
-          : `created new folder "${uploadResult.folderName}"`;
-
-        await db.insert(auditLogs).values({
-          packetId: recipient.packetId, action: 'uploaded', details: `Signed PDF uploaded to SharePoint: ${uploadResult.url} — ${matchInfo}`,
-        });
-      } catch (err) {
-        console.error('[SharePoint] Failed to upload signed PDF:', err);
-        const errorMsg = err instanceof Error ? err.message : String(err);
-        await db.update(signingPackets)
-          .set({ sharepointError: errorMsg })
-          .where(eq(signingPackets.id, recipient.packetId))
-          .catch(() => {});
-        await db.insert(auditLogs).values({
-          packetId: recipient.packetId, action: 'upload_failed', details: `SharePoint upload failed: ${errorMsg}`,
-        }).catch(() => {});
-      }
+      // The signature itself is saved; an admin can retry finalization from the packet page.
+      console.error(`[Signing] Finalization failed for packet ${recipient.packetId}:`, err);
+      return c.json({
+        success: true, completed: false,
+        message: 'Your signature has been recorded. The final document is still being processed.',
+      });
     }
 
     return c.json({ success: true, completed: true, message: 'Document has been fully signed' });
@@ -319,6 +246,8 @@ signingRoutes.get('/:token/pdf', async (c) => {
   });
 
   if (!recipient) return c.json({ error: 'Invalid token' }, 404);
+  if (isTokenExpired(recipient.tokenExpiresAt)) return c.json({ error: 'This signing link has expired' }, 410);
+  if (recipient.packet.status === 'cancelled') return c.json({ error: 'This signing request has been cancelled' }, 400);
 
   try {
     const pdfBuffer = await downloadFile(recipient.packet.filePath);

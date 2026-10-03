@@ -1,61 +1,6 @@
 import { describe, it, expect } from 'vitest';
 
-// Inline the pure functions from sharepoint.service.ts for unit testing
-// without requiring database or network connections.
-
-function normalizeName(name: string): string {
-  return name
-    .trim()
-    .toLowerCase()
-    .replace(/\s+/g, ' ')
-    .replace(/[^\w\s-]/g, '');
-}
-
-function sequenceMatchRatio(a: string, b: string): number {
-  if (a.length === 0 && b.length === 0) return 1.0;
-  if (a.length === 0 || b.length === 0) return 0.0;
-
-  const totalLength = a.length + b.length;
-
-  function countMatches(
-    aStart: number, aEnd: number,
-    bStart: number, bEnd: number
-  ): number {
-    let bestLen = 0;
-    let bestAStart = 0;
-    let bestBStart = 0;
-
-    for (let i = aStart; i < aEnd; i++) {
-      for (let j = bStart; j < bEnd; j++) {
-        let k = 0;
-        while (i + k < aEnd && j + k < bEnd && a[i + k] === b[j + k]) {
-          k++;
-        }
-        if (k > bestLen) {
-          bestLen = k;
-          bestAStart = i;
-          bestBStart = j;
-        }
-      }
-    }
-
-    if (bestLen === 0) return 0;
-
-    let matches = bestLen;
-    if (bestAStart > aStart && bestBStart > bStart) {
-      matches += countMatches(aStart, bestAStart, bStart, bestBStart);
-    }
-    const aRight = bestAStart + bestLen;
-    const bRight = bestBStart + bestLen;
-    if (aRight < aEnd && bRight < bEnd) {
-      matches += countMatches(aRight, aEnd, bRight, bEnd);
-    }
-    return matches;
-  }
-
-  const matches = countMatches(0, a.length, 0, b.length);
-  return (2.0 * matches) / totalLength;
-}
+import { normalizeName, sequenceMatchRatio, findBestFolderMatch } from '../services/name-matching.js';
 
 interface SharePointFolder {
   id: string;
@@ -64,40 +9,6 @@ interface SharePointFolder {
   childCount: number;
   path: string;
   parentFolder: string;
-}
-
-interface FolderMatch {
-  folder: SharePointFolder;
-  confidence: number;
-}
-
-function findBestFolderMatch(
-  employeeName: string,
-  folders: SharePointFolder[],
-  threshold: number = 0.6
-): FolderMatch | null {
-  if (folders.length === 0) return null;
-
-  const normalized = normalizeName(employeeName);
-  if (!normalized) return null;
-
-  let bestMatch: FolderMatch | null = null;
-
-  for (const folder of folders) {
-    const folderNormalized = normalizeName(folder.name);
-    if (!folderNormalized) continue;
-
-    if (normalized === folderNormalized) {
-      return { folder, confidence: 1.0 };
-    }
-
-    const ratio = sequenceMatchRatio(normalized, folderNormalized);
-    if (ratio >= threshold && (!bestMatch || ratio > bestMatch.confidence)) {
-      bestMatch = { folder, confidence: ratio };
-    }
-  }
-
-  return bestMatch;
 }
 
 function makeFolder(name: string): SharePointFolder {
@@ -174,17 +85,25 @@ describe('SharePoint Name Matching', () => {
       expect(result!.confidence).toBeGreaterThan(0.8);
     });
 
-    it('does not match reversed name order below threshold (known limitation)', () => {
-      // "john smith" vs "smith john" — ratio ~0.59, below default 0.6 threshold
-      // Sequence matching is order-sensitive; this is expected behavior
+    it('matches reversed name order ("John Smith" -> "Smith, John")', () => {
       const result = findBestFolderMatch('John Smith', folders);
-      expect(result).toBeNull();
-    });
-
-    it('matches reversed name order with lower threshold', () => {
-      const result = findBestFolderMatch('John Smith', folders, 0.5);
       expect(result).not.toBeNull();
       expect(result!.folder.name).toBe('Smith, John');
+      expect(result!.confidence).toBe(1.0);
+    });
+
+    it('fuzzy matches a typo in reversed order', () => {
+      const result = findBestFolderMatch('Jon Smith', folders);
+      expect(result!.folder.name).toBe('Smith, John');
+    });
+
+    it('ignores middle initials', () => {
+      expect(findBestFolderMatch('John M. Smith', folders)!.folder.name).toBe('Smith, John');
+    });
+
+    it('does not merge different people who only look similar', () => {
+      expect(findBestFolderMatch('John Smithson', [makeFolder('Smith, John')])).toBeNull();
+      expect(findBestFolderMatch('Jane Doering', folders)).toBeNull();
     });
 
     it('returns null for no match', () => {

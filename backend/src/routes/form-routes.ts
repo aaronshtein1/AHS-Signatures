@@ -119,7 +119,7 @@ formRouteRoutes.post('/:id/pull', async (c) => {
     return c.json({ error: 'Google Drive not connected. Please authorize first.' }, 400);
   }
 
-  const days = parseInt(c.req.query('days') || '7', 10);
+  const days = Math.min(Math.max(parseInt(c.req.query('days') || '7', 10) || 7, 1), 365);
   const since = new Date();
   since.setDate(since.getDate() - days);
 
@@ -155,23 +155,27 @@ formRouteRoutes.post('/:id/pull', async (c) => {
           console.error(`[Pull] Placeholder parse error for ${file.name}:`, err);
         }
 
-        if (route.signerEmail && route.signerName) {
-          const token = generateSecureToken();
-          const tokenExpiresAt = getTokenExpiryDate();
+        const packetName = `${route.formName} - ${employeeName || file.name.replace(/\.pdf$/i, '')}`;
+        const hasSigner = !!(route.signerEmail && route.signerName);
+        const token = generateSecureToken();
+        const tokenExpiresAt = getTokenExpiryDate();
 
-          // Create packet and recipient in transaction
-          const packet = await db.transaction(async (tx) => {
-            const [pkt] = await tx.insert(signingPackets).values({
-              id: packetId,
-              name: `${route.formName} - ${employeeName || file.name.replace('.pdf', '')}`,
-              fileName: originalFileName,
-              filePath: storageKey,
-              placeholders: JSON.stringify(placeholders),
-              status: 'sent',
-              employeeName: employeeName || null,
-              formRouteId: route.id,
-            }).returning();
+        // Packet, recipient and the processed marker are written together so a
+        // failure part-way never leaves a packet that gets re-created on the next pull.
+        const recipientId = await db.transaction(async (tx) => {
+          await tx.insert(signingPackets).values({
+            id: packetId,
+            name: packetName,
+            fileName: originalFileName,
+            filePath: storageKey,
+            placeholders: JSON.stringify(placeholders),
+            status: hasSigner ? 'sent' : 'pending_assignment',
+            employeeName: employeeName || null,
+            formRouteId: route.id,
+          });
 
+          let recId: string | null = null;
+          if (hasSigner) {
             const [rec] = await tx.insert(recipients).values({
               packetId,
               roleName: route.signerRole,
@@ -182,42 +186,35 @@ formRouteRoutes.post('/:id/pull', async (c) => {
               tokenExpiresAt,
               status: 'notified',
             }).returning();
+            recId = rec.id;
+          }
 
-            return { ...pkt, recipients: [rec] };
+          await tx.insert(processedSubmissions).values({
+            submissionId: file.id, formId: route.id, packetId, driveFileId: file.id,
           });
-
-          const signingUrl = generateSigningUrl(token);
-          await sendSigningRequest(route.signerEmail, route.signerName, packet.name, signingUrl, tokenExpiresAt);
-
-          await db.insert(auditLogs).values({
-            packetId, action: 'created', details: `Pulled from Google Drive (${file.name})`,
-          });
-          await db.insert(auditLogs).values({
-            packetId,
-            recipientId: packet.recipients[0].id,
-            action: 'sent',
-            details: `Signing request sent to ${route.signerEmail}`,
-          });
-        } else {
-          await db.insert(signingPackets).values({
-            id: packetId,
-            name: `${route.formName} - ${employeeName || file.name.replace('.pdf', '')}`,
-            fileName: originalFileName,
-            filePath: storageKey,
-            placeholders: JSON.stringify(placeholders),
-            status: 'pending_assignment',
-            employeeName: employeeName || null,
-            formRouteId: route.id,
-          });
-
-          await db.insert(auditLogs).values({
-            packetId, action: 'created', details: `Pulled from Google Drive (${file.name}) - pending assignment`,
-          });
-        }
-
-        await db.insert(processedSubmissions).values({
-          submissionId: file.id, formId: route.id, packetId, driveFileId: file.id,
+          return recId;
         });
+
+        await db.insert(auditLogs).values({
+          packetId, action: 'created',
+          details: `Pulled from Google Drive (${file.name})${hasSigner ? '' : ' - pending assignment'}` +
+            (placeholders.length === 0 ? ' - WARNING: no signature tags detected in PDF' : ''),
+        });
+
+        if (hasSigner && recipientId) {
+          try {
+            await sendSigningRequest(route.signerEmail!, route.signerName!, packetName, generateSigningUrl(token), tokenExpiresAt);
+            await db.insert(auditLogs).values({
+              packetId, recipientId, action: 'sent', details: `Signing request sent to ${route.signerEmail}`,
+            });
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            errors.push(`${file.name}: packet created but email failed (${msg}) - use Resend`);
+            await db.insert(auditLogs).values({
+              packetId, recipientId, action: 'email_failed', details: `Signing email to ${route.signerEmail} failed: ${msg}`,
+            });
+          }
+        }
 
         created++;
       } catch (err) {
