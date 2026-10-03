@@ -1,6 +1,21 @@
 version: '3.8'
 
 services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=ahs_signatures
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
   backend:
     build:
       context: ./backend
@@ -10,7 +25,10 @@ services:
     environment:
       - PORT=3001
       - NODE_ENV=production
-      - DATABASE_URL=file:/app/data/db.sqlite
+      - DATABASE_URL=postgresql://postgres:postgres@db:5432/ahs_signatures
+      - JWT_SECRET=${JWT_SECRET:-change-this-secret-in-production}
+      - ADMIN_SEED_EMAIL=${ADMIN_SEED_EMAIL:-}
+      - ADMIN_SEED_PASSWORD=${ADMIN_SEED_PASSWORD:-}
       - CORS_ORIGIN=http://localhost:3040
       - FRONTEND_URL=http://localhost:3040
       - TOKEN_EXPIRY_HOURS=72
@@ -23,8 +41,10 @@ services:
       - EMAIL_FROM=aronshteina@gmail.com
       - EMAIL_FROM_NAME=AHS Signatures
       - ADMIN_EMAIL=aronshteina@gmail.com
+    depends_on:
+      db:
+        condition: service_healthy
     volumes:
-      - backend-data:/app/data
       - backend-uploads:/app/uploads
       - backend-signed:/app/signed
     restart: unless-stopped
@@ -44,6 +64,6 @@ services:
     restart: unless-stopped
 
 volumes:
-  backend-data:
+  db-data:
   backend-uploads:
   backend-signed:

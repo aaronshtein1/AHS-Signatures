@@ -1,12 +1,27 @@
 version: '3.8'
 
 services:
+  # PostgreSQL for development (DATABASE_URL=postgresql://postgres:postgres@localhost:5432/ahs_signatures)
+  db:
+    image: postgres:16-alpine
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=ahs_signatures
+    ports:
+      - "5432:5432"
+    volumes:
+      - dev-db-data:/var/lib/postgresql/data
+
   # Mail catcher for development
   mailhog:
     image: mailhog/mailhog:latest
     ports:
       - "1025:1025"  # SMTP
       - "8025:8025"  # Web UI
+
+volumes:
+  dev-db-data:
 
 # Use this for local development:
 # 1. Run: docker-compose -f docker-compose.dev.yml up -d

@@ -13,9 +13,9 @@ A lightweight PDF signing system for internal acknowledgements. **Not intended f
 
 ## Tech Stack
 
-- **Backend**: Node.js, Fastify, TypeScript, Prisma (SQLite)
+- **Backend**: Node.js, Hono, TypeScript, Drizzle ORM (PostgreSQL)
 - **Frontend**: Next.js, React, Tailwind CSS
-- **PDF Processing**: pdf-lib
+- **PDF Processing**: pdf.js (tag detection), pdf-lib (stamping)
 - **Signature Capture**: signature_pad
 - **Email**: SendGrid or SMTP
 
@@ -28,7 +28,8 @@ A lightweight PDF signing system for internal acknowledgements. **Not intended f
 git clone <repo-url>
 cd AHS-Signatures
 
-# Start all services
+# Start all services (PostgreSQL, backend, frontend)
+# Set ADMIN_SEED_EMAIL / ADMIN_SEED_PASSWORD / JWT_SECRET in your shell or a .env file first
 docker-compose up -d
 
 # Access the application
@@ -40,15 +41,15 @@ docker-compose up -d
 ### Local Development
 
 ```bash
-# Start MailHog for email testing
+# Start PostgreSQL + MailHog
 docker-compose -f docker-compose.dev.yml up -d
 
 # Backend setup
 cd backend
 cp .env.example .env
 npm install
-npm run db:push
-npm run db:seed  # Optional: seed demo data
+npm run db:migrate   # create/upgrade the schema (idempotent)
+npm run db:seed      # admin@example.com / admin123 in development
 npm run dev
 
 # Frontend setup (new terminal)
@@ -141,12 +142,22 @@ appended at the end. Dates use the `TIMEZONE` env var (default `America/New_York
 
 ### Environment Variables
 
-See `.env.example` for all available options.
+See `backend/.env.example` for all available options.
 
 **Required for production:**
-- `DATABASE_URL`: SQLite database path
-- `FRONTEND_URL`: Public URL for signing links
-- `EMAIL_*`: Email provider configuration
+- `DATABASE_URL`: PostgreSQL connection string
+- `JWT_SECRET`: long random value (the default is public and lets anyone forge logins)
+- `ADMIN_SEED_EMAIL` / `ADMIN_SEED_PASSWORD`: initial admin account (only needed once)
+- `FRONTEND_URL`, `CORS_ORIGIN`, `API_BASE_URL`: public URLs
+- `AWS_*`: S3-compatible bucket for documents (otherwise files are kept on the container disk)
+- `EMAIL_*` / `SMTP_*`: Email provider configuration
+
+### Deployment
+
+The backend Docker image runs, on every start: `node dist/db/migrate.js` (creates missing
+tables/columns/indexes, never drops anything — safe on an existing database), then
+`node dist/db/seed.js` (creates the admin account if it does not exist; skipped when the
+seed variables are not set), then the server.
 
 ### Email Providers
 

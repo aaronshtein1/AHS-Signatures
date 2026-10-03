@@ -2,7 +2,7 @@ import bcrypt from 'bcryptjs';
 import { drizzle } from 'drizzle-orm/node-postgres';
 import { Pool } from 'pg';
 import { eq } from 'drizzle-orm';
-import * as schema from '../src/db/schema.js';
+import * as schema from './schema.js';
 
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 const db = drizzle(pool, { schema });
@@ -22,17 +22,18 @@ async function main() {
   const adminPassword = process.env.ADMIN_SEED_PASSWORD || (isProduction ? '' : 'admin123');
   const adminName = process.env.ADMIN_SEED_NAME || 'Admin';
 
+  // Runs on every deploy: missing/weak seed settings skip seeding instead of
+  // crashing the container (the admin account usually exists already).
   if (!adminEmail || !adminPassword) {
-    console.error(
-      'ERROR: In production, you must set ADMIN_SEED_EMAIL and ADMIN_SEED_PASSWORD.\n' +
-      'These environment variables define the initial admin account.'
+    console.warn(
+      'Seed skipped: set ADMIN_SEED_EMAIL and ADMIN_SEED_PASSWORD to create the initial admin account.'
     );
-    process.exit(1);
+    return;
   }
 
   if (isProduction && adminPassword.length < 12) {
-    console.error('ERROR: ADMIN_SEED_PASSWORD must be at least 12 characters in production.');
-    process.exit(1);
+    console.warn('Seed skipped: ADMIN_SEED_PASSWORD must be at least 12 characters in production.');
+    return;
   }
 
   const adminHash = await hashPassword(adminPassword);

@@ -12,6 +12,12 @@ import { webhookRoutes } from './routes/webhook.js';
 import { formRouteRoutes } from './routes/form-routes.js';
 import { googleDriveRoutes } from './routes/google-drive.js';
 
+if (process.env.NODE_ENV === 'production' &&
+    (!process.env.JWT_SECRET || config.JWT_SECRET === 'change-this-secret-in-production')) {
+  // Login tokens signed with the public default secret can be forged by anyone
+  console.error('SECURITY: JWT_SECRET is not set - set it to a long random value in production.');
+}
+
 const app = new Hono();
 
 // Extract client IP from various proxy headers

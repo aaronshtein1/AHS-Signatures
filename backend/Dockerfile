@@ -1,31 +1,18 @@
-FROM node:20-slim
-
-# Install OpenSSL for Prisma
-RUN apt-get update && apt-get install -y openssl ca-certificates && rm -rf /var/lib/apt/lists/*
-
+FROM node:20-slim AS build
 WORKDIR /app
-
-# Install dependencies
 COPY package*.json ./
 RUN npm ci
-
-# Copy prisma schema
-COPY prisma ./prisma
-
-# Generate Prisma client
-RUN npx prisma generate
-
-# Copy source code
 COPY . .
+RUN npm run build && npm prune --omit=dev
 
-# Build TypeScript
-RUN npm run build
-
-# Create directories for uploads and data
-RUN mkdir -p uploads/templates uploads/packets uploads/signatures signed data
-
-# Expose port
+FROM node:20-slim
+WORKDIR /app
+ENV NODE_ENV=production
+COPY --from=build /app/package*.json ./
+COPY --from=build /app/node_modules ./node_modules
+COPY --from=build /app/dist ./dist
+# Local file storage is used only when AWS_ACCESS_KEY_ID is not set
+RUN mkdir -p uploads signed
 EXPOSE 3001
-
-# Run migrations, seed (idempotent upsert), and start server
-CMD npx prisma migrate deploy && npx tsx prisma/seed.ts && npm start
+# Create/upgrade the schema (idempotent), seed the admin user if configured, start
+CMD ["sh", "-c", "node dist/db/migrate.js && node dist/db/seed.js && exec node dist/index.js"]
